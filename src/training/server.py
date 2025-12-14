@@ -6,12 +6,14 @@ from .aggregator import Aggregator
 from .client import Client
 from .compression.quantization import quantize_8bit, dequantize_8bit
 from .strategy_controller import StrategyController
+from .algorithms.scaffold import ScaffoldState
 from ..scheduling.fairness_ledger import FairnessDebtLedger
 from ..scheduling.scorer import ClientScorer
 from ..scheduling.selector import TopKSelector
 from ..wireless.channel import ChannelSimulator
 from ..wireless.bandwidth import BandwidthAllocator
 from ..wireless.energy import EnergyEstimator
+
 
 class Server:
     def __init__(self, model_fn, train_dataset, test_dataset, num_classes: int, cfg: Dict[str, Any], device):
@@ -24,19 +26,31 @@ class Server:
         self.cfg = cfg
         self.device = device
         self.num_clients = cfg['clients']['num_clients']
+        # 训练算法：fedavg / fedprox / scaffold
+        self.algorithm = cfg.get('training', {}).get('algorithm', 'fedavg')
+
         # Partition indices placeholder (filled externally)
-        self.clients = []
+        self.clients: List[Client] = []
         self.aggregator = Aggregator(cfg)
         self.channel = ChannelSimulator(cfg, self.num_clients)
         self.bw_alloc = BandwidthAllocator(cfg)
         self.energy = EnergyEstimator(cfg)
         self.ledger = FairnessDebtLedger(cfg, self.num_clients)
         self.scorer = ClientScorer(cfg, self.num_clients, self.ledger)
-        self.selector = TopKSelector(cfg['clients']['selection_top_k'], cfg['clients'].get('sliding_window',5), cfg['clients'].get('hysteresis',0.05))
+        self.selector = TopKSelector(
+            cfg['clients']['selection_top_k'],
+            cfg['clients'].get('sliding_window', 5),
+            cfg['clients'].get('hysteresis', 0.05),
+        )
         # 策略控制器：在半同步 / 异步 / 桥接态间切换（对应问题4）
         self.strategy = StrategyController(cfg, self.num_clients)
         self.training_cfg = cfg.get('training', {})
         self.semi_sync_wait_ratio = self.training_cfg.get('semi_sync_wait_ratio', 0.7)
+
+        # 若使用 SCAFFOLD，初始化控制变元状态（对应问题2中的稳健 non-IID 优化）
+        self.scaffold_state: ScaffoldState | None = None
+        if self.algorithm == 'scaffold':
+            self.scaffold_state = ScaffoldState(self.global_state)
 
     def init_clients(self, partitions: Dict[int, List[int]], model_fn):
         self.clients = []
@@ -53,11 +67,14 @@ class Server:
         mode, bridge_w, bw_factor = self.strategy.decide_mode(r)
 
         # Prepare metrics for scoring
-        energy_avail = [1.0 - min(1.0, self.energy.compute_energy(len(partitions[cid]))/10.0) for cid in range(self.num_clients)]
+        energy_avail = [
+            1.0 - min(1.0, self.energy.compute_energy(len(partitions[cid])) / 10.0)
+            for cid in range(self.num_clients)
+        ]
         channel_quality = [1.0 - stats[cid]['per'] for cid in range(self.num_clients)]
         # Data value: rarity of labels approximated by client size (placeholder)
         data_value = [len(partitions[cid]) for cid in range(self.num_clients)]
-        bandwidth_cost = [len(partitions[cid])/1000.0 for cid in range(self.num_clients)]
+        bandwidth_cost = [len(partitions[cid]) / 1000.0 for cid in range(self.num_clients)]
         # Score and select
         scores = self.scorer.score(energy_avail, channel_quality, data_value, bandwidth_cost)
         selected = self.selector.select(scores)
@@ -67,7 +84,10 @@ class Server:
         bw_map = self.bw_alloc.allocate_uniform(selected)
 
         # 估算各客户端发送时间，用于半同步模式的“等待比例”判定
-        tx_times = {cid: self.bw_alloc.estimate_tx_time(payload_mb=1.0, allocated_mb=bw_map.get(cid, 0.0)) for cid in selected}
+        tx_times = {
+            cid: self.bw_alloc.estimate_tx_time(payload_mb=1.0, allocated_mb=bw_map.get(cid, 0.0))
+            for cid in selected
+        }
         on_time_clients = list(selected)
         if mode in ('semi_sync', 'bridge') and len(tx_times) > 0:
             # 按发送时间分位数确定“等待阈值”，只接收一部分较快客户端的更新
@@ -76,9 +96,11 @@ class Server:
             on_time_clients = [cid for cid in selected if tx_times[cid] <= threshold]
 
         # Local updates
-        client_states = []
-        weights = []
-        staleness = []
+        client_states: List[Dict[str, Any]] = []
+        weights: List[float] = []
+        staleness: List[int] = []
+        scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
+
         for cid in selected:
             per = stats[cid]['per']
             # Packet loss: skip update entirely
@@ -88,7 +110,12 @@ class Server:
                 # 半同步/桥接态下，超出等待阈值的客户端被视为“迟到”，本轮不参与同步聚合
                 continue
             cl = self.clients[cid]
-            sd = cl.local_train(self.global_state)
+            if self.algorithm == 'scaffold' and self.scaffold_state is not None:
+                out = cl.local_train_scaffold(self.global_state, self.scaffold_state)
+                sd = out['state']
+                scaffold_deltas[cid] = out['delta_ci']
+            else:
+                sd = cl.local_train(self.global_state)
             # optional compression
             if self.cfg.get('compression', {}).get('quantization_8bit', False):
                 q = quantize_8bit(sd)
@@ -109,6 +136,12 @@ class Server:
                 mode=mode,
                 bridge_weight=bridge_w,
             )
+
+        # 若为 SCAFFOLD 算法，聚合后更新全局控制向量 c_global
+        if self.algorithm == 'scaffold' and self.scaffold_state is not None and scaffold_deltas:
+            w_map = {cid: len(partitions[cid]) for cid in scaffold_deltas.keys()}
+            self.scaffold_state.update_global(scaffold_deltas, w_map)
+
         # Update fairness ledger
         self.ledger.on_round_end(selected)
         # Evaluate
@@ -118,12 +151,23 @@ class Server:
         model.load_state_dict(self.global_state)
         acc = eval_model(model, test_loader, self.device)
         # Costs (rough)
-        comm_time = sum(self.bw_alloc.estimate_tx_time(payload_mb=1.0, allocated_mb=bw_map.get(cid, 0.0)) for cid in selected)  # 1MB payload placeholder
-        comm_energy = sum(self.energy.comm_energy(self.bw_alloc.estimate_tx_time(1.0, bw_map.get(cid, 0.0))) for cid in selected)
+        comm_time = sum(
+            self.bw_alloc.estimate_tx_time(payload_mb=1.0, allocated_mb=bw_map.get(cid, 0.0))
+            for cid in selected
+        )  # 1MB payload placeholder
+        comm_energy = sum(
+            self.energy.comm_energy(self.bw_alloc.estimate_tx_time(1.0, bw_map.get(cid, 0.0)))
+            for cid in selected
+        )
         comp_energy = sum(self.energy.compute_energy(len(partitions[cid])) for cid in selected)
 
         # 使用本轮指标更新策略控制器（多指标门控与迟滞逻辑依赖于这里的统计）
-        self.strategy.register_round_metrics(r, avg_per=avg_per, jain_index=self.jain_index_selection(), total_energy=comm_energy + comp_energy)
+        self.strategy.register_round_metrics(
+            r,
+            avg_per=avg_per,
+            jain_index=self.jain_index_selection(),
+            total_energy=comm_energy + comp_energy,
+        )
 
         # 恢复带宽预算
         self.bw_alloc.budget_mb = orig_budget
@@ -136,6 +180,9 @@ class Server:
             'comm_energy': comm_energy,
             'comp_energy': comp_energy,
             'jain_index': self.jain_index_selection(),
+            'sync_mode': mode,
+            'avg_per': avg_per,
+            'bandwidth_factor': float(bw_factor),
         }
 
     def jain_index_selection(self) -> float:
@@ -146,5 +193,4 @@ class Server:
                 freq[cid] += 1
         if freq.sum() == 0:
             return 0.0
-        return float((freq.sum()**2) / (self.num_clients * (freq**2).sum() + 1e-9))
-
+        return float((freq.sum() ** 2) / (self.num_clients * (freq ** 2).sum() + 1e-9))

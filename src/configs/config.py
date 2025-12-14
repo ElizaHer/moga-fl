@@ -13,12 +13,20 @@ def merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Provide minimal defaults to avoid KeyError
     cfg.setdefault('dataset', {})
     cfg['dataset'].setdefault('root', 'data')
+
+    # 模型相关默认配置：支持 small_cnn / resnet18_cifar / resnet18_emnist
+    cfg.setdefault('model', {})
+    cfg['model'].setdefault('type', 'small_cnn')
+    cfg['model'].setdefault('width_factor', 1.0)
+
     cfg.setdefault('clients', {})
     cfg['clients'].setdefault('num_clients', 10)
     cfg['clients'].setdefault('selection_top_k', max(1, cfg['clients']['num_clients']//2))
+
     cfg.setdefault('wireless', {})
     cfg['wireless'].setdefault('channel_model', 'rayleigh_siso')
     cfg['wireless'].setdefault('carrier_ghz', 3.5)
+
     cfg.setdefault('training', {})
     # 聚合与同步模式：sync / semi_sync / async，默认保持向后兼容
     if 'sync_mode' not in cfg['training']:
@@ -27,6 +35,9 @@ def merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
             cfg['training']['sync_mode'] = 'semi_sync'
         else:
             cfg['training']['sync_mode'] = 'async'
+    # 训练算法：fedavg / fedprox / scaffold
+    cfg['training'].setdefault('algorithm', 'fedavg')
+
     cfg.setdefault('compression', {})
     cfg.setdefault('scheduling', {})
     cfg['scheduling'].setdefault('weights', {
@@ -44,5 +55,6 @@ def merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     strat.setdefault('min_rounds_between_switch', 5)
     strat.setdefault('weights', {'per': 0.5, 'fairness': 0.3, 'energy': 0.2})
     strat.setdefault('bandwidth_rebalance', {'low_energy_factor': 0.8, 'high_energy_factor': 1.0})
+
     cfg.setdefault('eval', {'rounds': 5, 'test_interval': 1, 'seed': 42, 'save_csv': True, 'save_plots': True, 'preference': 'time'})
     return cfg
