@@ -29,7 +29,7 @@ class Client:
                 if mu > 0.0:
                     prox = 0.0
                     for p, g in zip(self.model.parameters(), global_state.values()):
-                        prox += ((p - torch.tensor(g).to(self.device))**2).sum()
+                        prox += ((p - g.detach().clone().to(self.device))**2).sum()
                     loss = loss + (mu/2.0) * prox
                 loss.backward()
                 opt.step()

@@ -109,6 +109,3 @@ python scripts/run_baselines.py --config configs/default_cifar10.yaml
 - 无法下载数据：使用 quick_* 配置自动回退 FakeData。或手动提前下载 torchvision 数据集。
 - 运行慢：将 local_epochs 降为 1、clients=10–20、samples_per_client 降低；使用 CPU 也可运行但更慢。
 - 图表中文乱码：已在代码中设置 Noto Sans CJK SC；若依然有警告，请安装字体并检查路径。
-
-## 许可
-本工程用于教学与研究复现，欢迎在不超出许可的前提下扩展。

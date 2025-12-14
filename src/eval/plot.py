@@ -2,8 +2,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Chinese font config
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC'] + plt.rcParams['font.sans-serif']
+plt.rcParams['font.family'] = ['sans-serif']
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 def plot_curves(df, out_prefix):
     fig, ax = plt.subplots(figsize=(10,6), dpi=200)
