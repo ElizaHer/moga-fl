@@ -23,6 +23,8 @@ wireless:
   tx_power_watts: 1.5
   compute_power_watts: 10.0
   compute_rate_samples_per_sec: 2000
+  channel_model: deepmimo_like_urban  # 简化的 DeepMIMO-Like 城市毫米波场景
+  carrier_ghz: 3.5
 training:
   algorithm: fedavg
   local_epochs: 1
@@ -30,6 +32,7 @@ training:
   lr: 0.01
   momentum: 0.9
   sync: true
+  sync_mode: semi_sync  # 中低丢包场景默认使用半同步聚合
   semi_sync_wait_ratio: 0.7
   fedprox_mu: 0.01
   scaffold: true
@@ -37,6 +40,9 @@ training:
     enabled: false
     buffer_size: 24
     staleness_alpha: 1.0
+    max_staleness: 5
+    async_agg_interval: 2
+    min_updates_to_aggregate: 8
 compression:
   quantization_8bit: true
   topk_fraction: 0.2

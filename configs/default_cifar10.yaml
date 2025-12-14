@@ -23,6 +23,8 @@ wireless:
   tx_power_watts: 1.5
   compute_power_watts: 12.0
   compute_rate_samples_per_sec: 4000
+  channel_model: tr38901_umi  # 简化 3GPP TR 38.901 UMi NLOS 场景
+  carrier_ghz: 3.5
 training:
   algorithm: fedavg
   local_epochs: 2
@@ -30,6 +32,7 @@ training:
   lr: 0.01
   momentum: 0.9
   sync: true
+  sync_mode: async  # 高丢包/复杂场景下默认偏向异步 FedBuff
   semi_sync_wait_ratio: 0.8
   fedprox_mu: 0.01
   scaffold: true
@@ -37,6 +40,9 @@ training:
     enabled: true
     buffer_size: 64
     staleness_alpha: 1.0
+    max_staleness: 8
+    async_agg_interval: 2
+    min_updates_to_aggregate: 16
 compression:
   quantization_8bit: true
   topk_fraction: 0.1

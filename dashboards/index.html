@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>无线边缘联邦学习调度实验面板</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="联邦学习无线边缘调度实验结果可视化仪表盘，用于查看训练曲线与 MOGA-FL Pareto 候选。" />
+  <link rel="stylesheet" href="style.css" />
+  <!-- 轻量 Chart.js CDN，不需要打包工具 -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="top-bar">
+    <div class="top-bar__title">
+      <h1>无线边缘联邦学习调度实验面板</h1>
+      <p>基于当前代码工程生成的训练曲线与多目标遗传优化（MOGA-FL）结果，可用于论文实验浏览与对比。</p>
+    </div>
+    <div class="top-bar__controls">
+      <label for="run-select">实验运行：</label>
+      <select id="run-select">
+        <option value="">加载中...</option>
+      </select>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="card" id="section-status">
+      <div class="card__header">
+        <h2>数据加载状态</h2>
+      </div>
+      <div class="card__body">
+        <p id="status-message">正在从 <code>dashboards/metrics_summary.json</code> 与 <code>dashboards/pareto_summary.json</code> 加载数据...</p>
+      </div>
+    </section>
+
+    <section class="card" id="section-training">
+      <div class="card__header">
+        <h2>联邦学习训练过程曲线</h2>
+        <p class="card__subtitle">展示精度、能耗与参与公平性随轮次的变化，用于观察收敛过程与资源开销。</p>
+      </div>
+      <div class="card__body">
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>精度 vs 轮次</h3>
+            <canvas id="accuracy-chart"></canvas>
+          </div>
+          <div class="chart-card">
+            <h3>Jain 公平指数 vs 轮次</h3>
+            <canvas id="fairness-chart"></canvas>
+          </div>
+          <div class="chart-card">
+            <h3>能耗 vs 轮次</h3>
+            <canvas id="energy-chart"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="section-pareto">
+      <div class="card__header card__header--row">
+        <div>
+          <h2>MOGA-FL Pareto 候选点</h2>
+          <p class="card__subtitle">展示多目标遗传算法搜索到的候选解，可切换横纵轴以查看精度、时间、公平与能耗之间的折衷关系。</p>
+        </div>
+        <div class="axis-controls">
+          <div class="axis-controls__group">
+            <label for="pareto-x-select">横轴：</label>
+            <select id="pareto-x-select"></select>
+          </div>
+          <div class="axis-controls__group">
+            <label for="pareto-y-select">纵轴：</label>
+            <select id="pareto-y-select"></select>
+          </div>
+        </div>
+      </div>
+      <div class="card__body">
+        <div class="chart-card chart-card--full">
+          <canvas id="pareto-chart"></canvas>
+        </div>
+        <div class="pareto-detail" id="pareto-detail">
+          <h3>候选点详情</h3>
+          <p>将鼠标移动到散点上，可在提示框中看到该解的关键指标与参数。这里会显示最近一次选中的点概览。</p>
+          <pre id="pareto-detail-pre" class="pareto-detail__pre">尚未选择任何候选点。</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="section-config">
+      <div class="card__header">
+        <h2>配置信息与时间序列统计</h2>
+        <p class="card__subtitle">从训练日志中提取的统计量，用于了解当前运行的整体特征。</p>
+      </div>
+      <div class="card__body info-grid">
+        <div class="info-card">
+          <h3>当前运行概览</h3>
+          <ul id="metrics-summary-list" class="kv-list"></ul>
+        </div>
+        <div class="info-card">
+          <h3>每轮选中客户端数量</h3>
+          <p class="info-card__hint">基于 metrics.csv 中的 <code>selected</code> 字段统计，用于观察调度 Top-K 的随时间变化。</p>
+          <canvas id="selected-chart"></canvas>
+        </div>
+        <div class="info-card">
+          <h3>使用说明（如何更新数据）</h3>
+          <ol class="steps">
+            <li>在项目根目录运行联邦训练脚本，生成最新的 <code>outputs/results/metrics.csv</code>：<br />
+              <code>python scripts/run_baselines.py --config configs/quick_cifar10.yaml</code>
+            </li>
+            <li>（可选）运行遗传优化，生成 <code>outputs/results/pareto_candidates.csv</code>：<br />
+              <code>python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml</code>
+            </li>
+            <li>执行数据预处理脚本，将 CSV 转为 JSON：<br />
+              <code>python scripts/prepare_dashboard_data.py</code>
+            </li>
+            <li>本地查看仪表盘：<br />
+              <code>cd dashboards &amp;&amp; python -m http.server 8000</code>，然后访问 <code>http://localhost:8000</code>。
+            </li>
+          </ol>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>本页面为无线边缘联邦学习调度毕设/实验提供轻量级可视化，数据源自项目 <code>outputs/results</code> 目录。</p>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

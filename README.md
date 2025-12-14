@@ -61,6 +61,36 @@ python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml --gene
 ```
 完成后会在 outputs/results/ 下生成 pareto_candidates.csv 与偏好部署示例。
 
+## 可视化仪表盘
+- 本项目提供一个无需打包工具的静态可视化页面，位于 `dashboards/` 目录。
+- 页面聚合展示：
+  - 训练过程曲线：精度 vs 轮次、能耗 vs 轮次、Jain 公平指数 vs 轮次；
+  - MOGA‑FL Pareto 候选点：可视化精度 / 时间 / 公平 / 能耗之间的折衷，并查看每个候选点的评分权重与 Top‑K 等参数；
+  - 运行统计：每轮选中客户端数量及当前运行的概览指标。
+
+**生成 / 刷新数据：**
+1. 运行联邦训练基线，生成最新的 `outputs/results/metrics.csv`：
+   ```bash
+   python scripts/run_baselines.py --config configs/quick_cifar10.yaml
+   ```
+2. （可选）运行遗传优化，生成 `outputs/results/pareto_candidates.csv`：
+   ```bash
+   python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml
+   ```
+3. 调用预处理脚本，将 CSV 汇总为前端使用的 JSON：
+   ```bash
+   python scripts/prepare_dashboard_data.py
+   ```
+   该脚本会在 `dashboards/` 中生成 `metrics_summary.json` 和 `pareto_summary.json`，仪表盘页面通过这两个文件加载数据。
+
+**本地查看仪表盘：**
+1. 在项目根目录执行：
+   ```bash
+   cd dashboards
+   python -m http.server 8000
+   ```
+2. 在浏览器访问 `http://localhost:8000`，即可看到“无线边缘联邦学习调度实验面板”页面。若直接用 `file://` 打开 HTML，部分浏览器会禁止 `fetch` 读取本地 JSON，建议使用上述简易 HTTP 服务。
+
 ## 配置与实验
 - 数据集：CIFAR‑10、EMNIST（balanced）；默认自动下载至 data/（若失败自动回退 FakeData）。
 - 非IID划分：Dirichlet（alpha）、标签偏置（每客户端限标签数）、数量偏置（样本量不均）。

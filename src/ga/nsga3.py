@@ -4,6 +4,11 @@ from .pareto import non_dominated_set
 from .constraints import penalty, repair
 
 class NSGA3:
+    """Simplified NSGA-III style optimizer.
+
+    在本工程中，它既可以单独使用，也会被 MOGA-FL 控制器调用
+    （问题1：多目标遗传优化的基础子算法之一）。"""
+
     def __init__(self, cfg: Dict[str, Any], eval_fn: Callable[[Dict[str, Any]], Dict[str, float]], pop_size=20):
         self.cfg = cfg
         self.eval_fn = eval_fn
@@ -44,8 +49,15 @@ class NSGA3:
         metrics['energy'] += pen
         return metrics
 
-    def run(self, generations=10):
-        pop = self.init_pop()
+    def run(self, generations=10, init_pop: List[Dict[str, Any]] | None = None):
+        """Run a small NSGA-III loop.
+
+        参数
+        ------
+        generations: 迭代轮数（通常较小，因为外层 MOGA-FL 还会做多轮调用）。
+        init_pop: 若给定，则从外部提供的初始种群开始（用于岛屿模型中的迁移）。
+        """
+        pop = init_pop if init_pop is not None else self.init_pop()
         sols = [self.evaluate(p) for p in pop]
         for g in range(generations):
             # Selection: keep non-dominated + random

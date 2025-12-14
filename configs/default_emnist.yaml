@@ -24,6 +24,8 @@ wireless:
   tx_power_watts: 1.2
   compute_power_watts: 14.0
   compute_rate_samples_per_sec: 3500
+  channel_model: quadriga_like_macro
+  carrier_ghz: 3.5
 training:
   algorithm: fedprox
   local_epochs: 2
@@ -31,6 +33,7 @@ training:
   lr: 0.01
   momentum: 0.9
   sync: true
+  sync_mode: async
   semi_sync_wait_ratio: 0.75
   fedprox_mu: 0.02
   scaffold: true
@@ -38,6 +41,9 @@ training:
     enabled: true
     buffer_size: 80
     staleness_alpha: 1.1
+    max_staleness: 10
+    async_agg_interval: 2
+    min_updates_to_aggregate: 24
 compression:
   quantization_8bit: true
   topk_fraction: 0.15
