@@ -35,7 +35,7 @@ training:
   lr: 0.01
   momentum: 0.9
   sync: true
-  sync_mode: semi_sync  # 中低丢包场景默认使用半同步聚合
+  sync_mode: sync  # 中低丢包场景默认使用半同步聚合
   semi_sync_wait_ratio: 0.7
   fedprox_mu: 0.01
   scaffold: true
@@ -55,14 +55,14 @@ scheduling:
     energy: 0.25
     channel: 0.25
     data_value: 0.25
-    fairness_debt: 0.2
+    fairness_debt: 0.05
     bandwidth_cost: -0.15
   fairness_ledger:
     debt_increase: 0.05
     repay_rate: 0.1
     max_debt: 1.0
 eval:
-  rounds: 5
+  rounds: 30
   test_interval: 1
   seed: 42
   save_csv: true

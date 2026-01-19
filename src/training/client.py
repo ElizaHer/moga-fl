@@ -49,6 +49,7 @@ class Client:
                 if mu > 0.0:
                     loss = loss + fedprox_regularizer(self.model, global_state, mu, self.device)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 opt.step()
 
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}

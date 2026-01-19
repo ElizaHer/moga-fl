@@ -1,11 +1,11 @@
 dataset:
   name: cifar10
   root: data
-  download: true
+  download: false
   use_fake_if_unavailable: false
   noniid:
     type: dirichlet
-    alpha: 0.3
+    alpha: 0.5
     label_bias_classes_per_client: 2
     quantity_bias_sigma: 0.8
   quick_samples: null
@@ -32,10 +32,10 @@ training:
   algorithm: fedavg
   local_epochs: 2
   batch_size: 64
-  lr: 0.01
+  lr: 0.5
   momentum: 0.9
   sync: true
-  sync_mode: async  # 高丢包/复杂场景下默认偏向异步 FedBuff
+  sync_mode: semi_sync  # 高丢包/复杂场景下默认偏向异步 FedBuff
   semi_sync_wait_ratio: 0.8
   fedprox_mu: 0.01
   scaffold: true
@@ -55,14 +55,14 @@ scheduling:
     energy: 0.25
     channel: 0.25
     data_value: 0.25
-    fairness_debt: 0.2
+    fairness_debt: 0.05
     bandwidth_cost: -0.2
   fairness_ledger:
     debt_increase: 0.05
     repay_rate: 0.1
     max_debt: 1.0
 eval:
-  rounds: 30
+  rounds: 100
   test_interval: 2
   seed: 2025
   save_csv: true

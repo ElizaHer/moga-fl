@@ -55,9 +55,11 @@ class Aggregator:
         bridge_weight: 在 "bridge" 模式下，同步结果与异步结果的插值权重。
         """
         current_mode = mode or self.mode
+        print(f"[sync mode] {current_mode}")
 
         # ---------- 纯同步 / 半同步：直接 FedAvg ----------
         if self.buffer is None or current_mode in ('sync', 'semi_sync'):
+            print(f"[(semi) sync agg]")
             if not client_states:
                 return global_state
             return aggregate_fedavg(global_state, client_states, weights)
@@ -99,9 +101,11 @@ class Aggregator:
 
         if current_mode == 'async':
             # 纯异步模式：直接返回异步聚合结果
+            print(f"[async agg]")
             return async_result
 
         # bridge 模式：将“本轮同步 FedAvg 结果”和“异步缓冲结果”做线性组合
+        print(f"[bridge agg] bridge weight: {bridge_weight}")
         if not client_states:
             # 没有新的同步更新，只能依赖异步结果
             return async_result

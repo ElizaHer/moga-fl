@@ -95,6 +95,10 @@ class Server:
             threshold = float(np.quantile(t_values, self.semi_sync_wait_ratio))
             on_time_clients = [cid for cid in selected if tx_times[cid] <= threshold]
 
+            late_clients = set(selected) - set(on_time_clients)
+            if late_clients:
+                print(f"[round {r}] late clients: {late_clients}")
+
         # Local updates
         client_states: List[Dict[str, Any]] = []
         weights: List[float] = []

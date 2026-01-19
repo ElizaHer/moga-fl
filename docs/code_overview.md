@@ -24,7 +24,7 @@
   - 支持：
     - CIFAR‑10：彩色图像分类；
     - EMNIST：手写字符（balanced / letters 等 split）。  
-  - 若下载失败或无网络，且 `use_fake_if_unavailable=True`，会自动使用 `torchvision.datasets.FakeData` 构造一个小型伪数据集，保证项目 “随时可跑”。
+  - 若下载失败或无网络，且 `use_fake_if_unavailable=True`，会自动使用 `torchvision.datasets.FakeData` 构造一个小型伪数据集，保证项目随时可跑。
 - **src/data/partition.py**  
   - `dirichlet_partition()`：按 Dirichlet 分布为每个客户端分配不同类别比例，用于模拟 label-level non‑IID。  
   - `label_bias_partition()`：给每个客户端随机分配少量固定类别，只在这些类上抽样，模拟 “每个设备只有少数类” 的极端 non‑IID。  
@@ -85,7 +85,7 @@
 - **src/training/algorithms/fedprox.py**  
   - 当前主要逻辑在 `client.py` 中实现近端正则，这个文件中预留了进一步封装 FedProx 的接口。
 - **src/training/algorithms/scaffold.py**  
-  - `ScaffoldState`：存放全局和本地的控制变元（control variates），用于 SCAFFOLD 式的方差减小（目前为简化版，占位结构）。
+  - `ScaffoldState`：存放全局和本地的控制变元（control variates），用于 SCAFFOLD 式的方差减小（**目前为简化版，占位结构**）。
 - **src/training/algorithms/fedbuff.py**  
   - `FedBuffBuffer`：实现异步缓冲式聚合的核心数据结构：
     - `push()`：将 (本地模型、陈旧度) 放入缓冲；
@@ -133,11 +133,11 @@
     - 交叉与高斯噪声变异；
     - 利用 `non_dominated_set()` 做非劣解保留；
     - 使用 `constraints.repair()` 与 `constraints.penalty()` 做轻量约束处理。  
-  - 局限：尚未实现真正意义上的参考点分配与多维度拥挤度控制，本轮将作为 “子组件” 被更高层的 MOGA‑FL 控制器调用。
+  - 局限：**尚未实现真正意义上的参考点分配与多维度拥挤度控制**，本轮将作为 “子组件” 被更高层的 MOGA‑FL 控制器调用。
 - **src/ga/moead.py**  
   - 简化版 MOEA/D：通过随机生成一组权重向量，把多目标问题分解为多个标量化子问题。  
   - 对每个子问题，在邻域内做交叉+变异，若新解在该权重下的标量化目标更好，则替换原解。  
-  - 目前也只是基础结构，本轮会在其之上封装更高层的 MOGA‑FL 控制。
+  - **目前也只是基础结构**，本轮会在其之上封装更高层的 MOGA‑FL 控制。
 - **src/ga/objectives.py**  
   - `evaluate_solution()`：给定一个“短轮联邦训练”结果，抽取 acc / time / fairness / energy 四个指标作为 GA 的目标。  
   - 与 `scripts/run_ga_optimization.py` 内部的 `make_sim_runner()` 协同工作。

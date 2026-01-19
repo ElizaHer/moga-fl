@@ -113,8 +113,10 @@ class StrategyController:
         # 目标模式决策
         target_mode = self.current_mode
         if gate_score >= self.to_async + self.hysteresis_margin:
+            print(f"[switch target mode] gate_score={gate_score:.3f} => async")
             target_mode = 'async'
         elif gate_score <= self.to_semi - self.hysteresis_margin:
+            print(f"[switch target mode] gate_score={gate_score:.3f} => semi_sync")
             target_mode = 'semi_sync'
 
         # 若目标模式与当前模式一致，则维持现状

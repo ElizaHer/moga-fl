@@ -72,6 +72,7 @@ python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml --gene
 1. 运行联邦训练基线，生成最新的 `outputs/results/metrics.csv`：
    ```bash
    python scripts/run_baselines.py --config configs/quick_cifar10.yaml
+   python scripts/run_baselines.py --config configs/default_cifar10.yaml
    ```
 2. （可选）运行遗传优化，生成 `outputs/results/pareto_candidates.csv`：
    ```bash
