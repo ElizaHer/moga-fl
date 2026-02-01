@@ -10,99 +10,33 @@ from src.training.models.resnet_cifar import build_resnet18_cifar
 
 def load_cifar10_data():
     """加载CIFAR-10数据集"""
-    transform = Compose([
+    train_transform = Compose([
         transforms.RandomHorizontalFlip(p=0.5),  # 随机水平翻转
         transforms.RandomCrop(32, padding=4),  # 随机裁剪
         ToTensor(),
         Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
 
-    train_dataset = CIFAR10(root='../data', train=True, download=True, transform=transform)
-    test_dataset = CIFAR10(root='../data', train=False, download=True, transform=transform)
+    test_transform = Compose([
+        ToTensor(),
+        Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    train_dataset = CIFAR10(root='../data', train=True, download=True, transform=train_transform)
+    test_dataset = CIFAR10(root='../data', train=False, download=True, transform=test_transform)
 
     return train_dataset, test_dataset
 
-
-def create_simple_partitions(train_dataset, num_clients=10, samples_per_client=180):
-    """创建简单的数据分区"""
-    total_samples = len(train_dataset)
-    indices = list(range(total_samples))
-    np.random.shuffle(indices)
-
-    partitions = {}
-    for i in range(num_clients):
-        start_idx = i * samples_per_client
-        end_idx = min((i + 1) * samples_per_client, total_samples)
-        partitions[i] = indices[start_idx:end_idx]
-
-    return partitions
-
-
-def create_iid_partitions(train_dataset, num_clients=10, samples_per_client=180):
-    """创建IID数据分区，确保每个客户端的数据分布相同"""
-    # 获取数据集的标签
-    targets = np.array(train_dataset.targets)
-
-    # 按类别分组索引
-    class_indices = {}
-    for class_idx in range(10):  # CIFAR-10有10个类别
-        class_indices[class_idx] = np.where(targets == class_idx)[0]
-
-    partitions = {i: [] for i in range(num_clients)}
-
-    # 为每个类别分配相同数量的样本到每个客户端
-    for class_idx in range(10):
-        np.random.shuffle(class_indices[class_idx])
-        samples_per_client_per_class = samples_per_client // 10  # 每个客户端每个类别的样本数
-
-        for client_idx in range(num_clients):
-            start_idx = client_idx * samples_per_client_per_class
-            end_idx = (client_idx + 1) * samples_per_client_per_class
-            partitions[client_idx].extend(class_indices[class_idx][start_idx:end_idx].tolist())
-
-    return partitions
-
-
-def create_overlapping_iid_partitions(train_dataset, num_clients=10, samples_per_client=180, overlap_ratio=0.3):
-    """创建有重叠的IID数据分区"""
-    targets = np.array(train_dataset.targets)
-    total_samples = len(train_dataset)
-
-    # 创建共享数据集（30%重叠）
-    shared_indices = np.random.choice(total_samples, size=int(total_samples * overlap_ratio), replace=False)
-    remaining_indices = list(set(range(total_samples)) - set(shared_indices))
-
-    partitions = {i: list(shared_indices) for i in range(num_clients)}  # 所有客户端共享部分数据
-
-    # 分配剩余数据
-    np.random.shuffle(remaining_indices)
-    samples_per_client_remaining = (samples_per_client - len(shared_indices)) // num_clients
-
-    for i in range(num_clients):
-        start_idx = i * samples_per_client_remaining
-        end_idx = (i + 1) * samples_per_client_remaining
-        partitions[i].extend(remaining_indices[start_idx:end_idx])
-
-    return partitions
-
-
-def create_whole_dataset(train_dataset, num_clients):
-    """为每个客户端分配所有数据"""
+def create_whole_dataset(train_dataset):
+    """为客户端分配所有数据"""
     print(f"数据集大小: {len(train_dataset)}")
 
-    partitions = {i: [] for i in range(num_clients)}
-    for i in range(num_clients):
-        start_idx = 0
-        end_idx = len(train_dataset)
-        partitions[i].extend(range(start_idx, end_idx))
-
-    return partitions
+    return range(0, len(train_dataset))
 
 class SimpleClient:
-    """简化版客户端，用于FedAvg测试"""
+    """简化版客户端，用于ResNet测试"""
 
-    def __init__(self, cid, model, train_dataset, indices, device, test_loader=None):
-        self.cid = cid
+    def __init__(self, model, train_dataset, indices, device, test_loader=None):
         self.model = model
         self.train_dataset = train_dataset
         self.indices = indices
@@ -140,8 +74,7 @@ class SimpleClient:
                 optimizer.step()
 
         train_accuracy = test_model_accuracy(self.model, loader, self.device)
-        test_accuracy = test_model_accuracy(self.model, self.test_loader, self.device)
-        print(f"Client {self.cid}, Epoch {epoch}, Train Accuracy: {train_accuracy:.2f}%, Test Accuracy: {test_accuracy:.2f}%")
+        print(f"Epoch {epoch}, Train Accuracy: {train_accuracy:.2f}%")
 
         # 返回更新后的模型状态
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -168,7 +101,6 @@ def test_model_accuracy(model, test_loader, device):
 def main():
     # 设置参数
     num_clients = 1
-    samples_per_client = 5000
     num_rounds = 1000
     local_epochs = 2
     batch_size = 128
@@ -192,15 +124,9 @@ def main():
 
     # 初始化全局模型
     print("初始化ResNet-18模型...")
-    global_model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
-    global_state = {k: v.detach().cpu().clone() for k, v in global_model.state_dict().items()}
-
-    # 创建客户端
-    clients = []
-    for cid in range(num_clients):
-        model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
-        client = SimpleClient(cid, model, train_dataset, partitions[cid], device, test_loader)
-        clients.append(client)
+    model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    client = SimpleClient(model, train_dataset, partitions, device, test_loader)
 
     # 训练循环
     print(f"开始{num_rounds}轮联邦训练...")
@@ -210,30 +136,12 @@ def main():
     no_improvement_count = 0
 
     for round_idx in range(num_rounds):
-        # print(f"\n=== 第 {round_idx + 1} 轮 ===")
+        state = client.local_train(
+            state, local_epochs, batch_size, lr, round_idx
+        )
 
-        # 随机选择部分客户端
-        selected_clients = np.random.choice(num_clients, size=max(1, num_clients // 2), replace=False)
-
-        client_states = []
-        weights = []
-
-        # 客户端本地训练
-        for cid in selected_clients:
-            # print(f"客户端 {cid} 训练中...")
-            client_update = clients[cid].local_train(
-                global_state, local_epochs, batch_size, lr, round_idx
-            )
-            client_states.append(client_update)
-            weights.append(len(partitions[cid]))
-
-        # 服务器聚合
-        if client_states:
-            global_state = client_states[0]
-
-        # 更新全局模型并测试准确率
-        global_model.load_state_dict(global_state)
-        accuracy = test_model_accuracy(global_model, test_loader, device)
+        model.load_state_dict(state)
+        accuracy = test_model_accuracy(model, test_loader, device)
         accuracy_history.append(accuracy)
 
         print(f"第 {round_idx + 1} 轮准确率: {accuracy:.2f}%")
@@ -243,7 +151,7 @@ def main():
             best_accuracy = accuracy
             no_improvement_count = 0
             # 保存最佳模型
-            torch.save(global_state, 'outputs/test_results/best_model.pth')
+            torch.save(state, 'outputs/test_results/best_model.pth')
         else:
             no_improvement_count += 1
 
@@ -259,8 +167,8 @@ def main():
 
     # 保存结果
     os.makedirs('outputs/test_results', exist_ok=True)
-    with open('outputs/test_results/fedavg_resnet_accuracy.txt', 'w') as f:
-        f.write(f"FedAvg + ResNet-18 {num_rounds}轮训练结果\n")
+    with open('outputs/test_results/only_resnet_accuracy.txt', 'w') as f:
+        f.write(f"ResNet-18 {num_rounds}轮训练结果\n")
         f.write("=" * 18 + "\n")
         for i, acc in enumerate(accuracy_history):
             f.write(f"第 {i + 1} 轮: {acc:.2f}%\n")
