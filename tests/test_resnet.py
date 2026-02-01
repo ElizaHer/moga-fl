@@ -124,7 +124,7 @@ def main():
 
     # 初始化全局模型
     print("初始化ResNet-18模型...")
-    model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
+    model = build_resnet18_cifar(num_classes=10, width_factor=1.0, dropout_rate=0.5).to(device)
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     client = SimpleClient(model, train_dataset, partitions, device, test_loader)
 

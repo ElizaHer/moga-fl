@@ -113,11 +113,14 @@ class ResNetCIFAR(nn.Module):
             self,
             num_classes: int = 10,
             width_factor: float = 1.0,
-            depth: int = 18
+            depth: int = 18,
+            dropout_rate: float = 0.0
     ) -> None:
         super().__init__()
         assert width_factor > 0, "width_factor must be positive"
         assert depth in [18, 50], "Only ResNet-18 and ResNet-50 are supported"
+        assert 0.0 <= dropout_rate < 1.0, "dropout_rate must be in [0, 1)"
+
 
         self.depth = depth
         self.block = BasicBlock if depth == 18 else Bottleneck
@@ -148,6 +151,7 @@ class ResNetCIFAR(nn.Module):
         self.layer4 = self._make_layer(self.block, c4, blocks=blocks_per_stage[3], stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
         self.fc = nn.Linear(c4 * self.block.expansion, num_classes)
 
     def _make_layer(
@@ -184,25 +188,26 @@ class ResNetCIFAR(nn.Module):
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        x = self.dropout(x)
         x = self.fc(x)
         return x
 
 
-def build_resnet18_cifar(num_classes: int = 10, width_factor: float = 1.0) -> ResNetCIFAR:
+def build_resnet18_cifar(num_classes: int = 10, width_factor: float = 1.0, dropout_rate: float = 0.0) -> ResNetCIFAR:
     """工厂函数：用于在 Server/Client 中根据配置构造 CIFAR-10 ResNet-18。
 
     参数
     ------
     num_classes: 分类类别数（CIFAR-10 为 10）。
     width_factor: 通道宽度缩放因子，<1.0 时得到窄版 ResNet，适合 quick 模式。"""
-    return ResNetCIFAR(num_classes=num_classes, width_factor=width_factor, depth=18)
+    return ResNetCIFAR(num_classes=num_classes, width_factor=width_factor, depth=18, dropout_rate=dropout_rate)
 
 
-def build_resnet50_cifar(num_classes: int = 10, width_factor: float = 1.0) -> ResNetCIFAR:
+def build_resnet50_cifar(num_classes: int = 10, width_factor: float = 1.0, dropout_rate: float = 0.0) -> ResNetCIFAR:
     """工厂函数：用于在 Server/Client 中根据配置构造 CIFAR-10 ResNet-50。
 
     参数
     ------
     num_classes: 分类类别数（CIFAR-10 为 10）。
     width_factor: 通道宽度缩放因子，<1.0 时得到窄版 ResNet，适合 quick 模式。"""
-    return ResNetCIFAR(num_classes=num_classes, width_factor=width_factor, depth=50)
+    return ResNetCIFAR(num_classes=num_classes, width_factor=width_factor, depth=50, dropout_rate=dropout_rate)
