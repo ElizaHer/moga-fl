@@ -116,7 +116,7 @@ def main():
 
     # 创建数据分区
     partitions = create_whole_dataset(
-        train_dataset, num_clients
+        train_dataset
     )
 
     # 创建测试数据加载器
@@ -132,7 +132,7 @@ def main():
     print(f"开始{num_rounds}轮联邦训练...")
     accuracy_history = []
     best_accuracy = 0.0
-    patience = 20  # 早停耐心值
+    patience = 30  # 早停耐心值
     no_improvement_count = 0
 
     for round_idx in range(num_rounds):
