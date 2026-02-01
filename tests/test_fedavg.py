@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor, Normalize, Compose
+from torchvision.transforms import ToTensor, Normalize, Compose, transforms
 from src.training.models.resnet_cifar import build_resnet18_cifar
 from src.training.algorithms.fedavg import aggregate_fedavg
 
@@ -12,6 +12,8 @@ from src.training.algorithms.fedavg import aggregate_fedavg
 def load_cifar10_data():
     """加载CIFAR-10数据集"""
     transform = Compose([
+        transforms.RandomHorizontalFlip(p=0.5),  # 随机水平翻转
+        transforms.RandomCrop(32, padding=4),  # 随机裁剪
         ToTensor(),
         Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
@@ -85,15 +87,28 @@ def create_overlapping_iid_partitions(train_dataset, num_clients=10, samples_per
     return partitions
 
 
+def create_whole_dataset(train_dataset, num_clients):
+    """为每个客户端分配所有数据"""
+    print(f"数据集大小: {len(train_dataset)}")
+
+    partitions = {i: [] for i in range(num_clients)}
+    for i in range(num_clients):
+        start_idx = 0
+        end_idx = len(train_dataset)
+        partitions[i].extend(range(start_idx, end_idx))
+
+    return partitions
+
 class SimpleClient:
     """简化版客户端，用于FedAvg测试"""
 
-    def __init__(self, cid, model, train_dataset, indices, device):
+    def __init__(self, cid, model, train_dataset, indices, device, test_loader=None):
         self.cid = cid
         self.model = model
         self.train_dataset = train_dataset
         self.indices = indices
         self.device = device
+        self.test_loader = test_loader
 
     def local_train(self, global_state, local_epochs=1, batch_size=32, lr=0.01, round_idx=None):
         """本地训练"""
@@ -111,7 +126,7 @@ class SimpleClient:
         # 每10轮降低学习率
         if round_idx is not None and round_idx > 0 and round_idx % 10 == 0:
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr * (0.95 ** (round_idx // 10))
+                param_group['lr'] = lr * (0.5 ** (round_idx // 10))
 
         # 训练循环
         for epoch in range(local_epochs):
@@ -124,8 +139,9 @@ class SimpleClient:
                 loss.backward()
                 optimizer.step()
 
-        accuracy = test_model_accuracy(self.model, loader, self.device)
-        print(f"Client {self.cid}, Epoch {epoch}, Accuracy: {accuracy:.2f}%")
+        train_accuracy = test_model_accuracy(self.model, loader, self.device)
+        test_accuracy = test_model_accuracy(self.model, self.test_loader, self.device)
+        print(f"Client {self.cid}, Epoch {epoch}, Train Accuracy: {train_accuracy:.2f}%, Test Accuracy: {test_accuracy:.2f}%")
 
         # 返回更新后的模型状态
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -155,7 +171,7 @@ def main():
     samples_per_client = 5000
     num_rounds = 100
     local_epochs = 2
-    batch_size = 524
+    batch_size = 128
     lr = 0.05
     overlap_ratio = 0.3  # 30%的数据重叠
 
@@ -167,10 +183,13 @@ def main():
     print("加载CIFAR-10数据集...")
     train_dataset, test_dataset = load_cifar10_data()
 
-    # 创建数据分区（使用有重叠的分区）
-    partitions = create_overlapping_iid_partitions(
-        train_dataset, num_clients, samples_per_client, overlap_ratio
+    # 创建数据分区
+    partitions = create_iid_partitions(
+        train_dataset, num_clients, samples_per_client
     )
+
+    # 创建测试数据加载器
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     # 初始化全局模型
     print("初始化ResNet-18模型...")
@@ -181,11 +200,8 @@ def main():
     clients = []
     for cid in range(num_clients):
         model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
-        client = SimpleClient(cid, model, train_dataset, partitions[cid], device)
+        client = SimpleClient(cid, model, train_dataset, partitions[cid], device, test_loader)
         clients.append(client)
-
-    # 创建测试数据加载器
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     # 训练循环
     print(f"开始{num_rounds}轮联邦训练...")
@@ -198,7 +214,7 @@ def main():
         # print(f"\n=== 第 {round_idx + 1} 轮 ===")
 
         # 随机选择部分客户端
-        selected_clients = np.random.choice(num_clients, size=max(1, num_clients // 2), replace=False)
+        selected_clients = np.random.choice(num_clients, int(num_clients * 1.0), replace=False)
 
         client_states = []
         weights = []
@@ -232,7 +248,7 @@ def main():
         else:
             no_improvement_count += 1
 
-        if no_improvement_count >= patience and round_idx > 100:
+        if no_improvement_count >= patience and round_idx > 30:
             print(f"早停触发，连续{patience}轮没有改进")
             break
 

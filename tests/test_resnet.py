@@ -4,13 +4,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor, Normalize, Compose
+from torchvision.transforms import ToTensor, Normalize, Compose, transforms
 from src.training.models.resnet_cifar import build_resnet18_cifar
 
 
 def load_cifar10_data():
     """加载CIFAR-10数据集"""
     transform = Compose([
+        transforms.RandomHorizontalFlip(p=0.5),  # 随机水平翻转
+        transforms.RandomCrop(32, padding=4),  # 随机裁剪
         ToTensor(),
         Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
@@ -21,7 +23,7 @@ def load_cifar10_data():
     return train_dataset, test_dataset
 
 
-def create_simple_partitions(train_dataset, num_clients=10, samples_per_client=500):
+def create_simple_partitions(train_dataset, num_clients=10, samples_per_client=180):
     """创建简单的数据分区"""
     total_samples = len(train_dataset)
     indices = list(range(total_samples))
@@ -36,15 +38,76 @@ def create_simple_partitions(train_dataset, num_clients=10, samples_per_client=5
     return partitions
 
 
+def create_iid_partitions(train_dataset, num_clients=10, samples_per_client=180):
+    """创建IID数据分区，确保每个客户端的数据分布相同"""
+    # 获取数据集的标签
+    targets = np.array(train_dataset.targets)
+
+    # 按类别分组索引
+    class_indices = {}
+    for class_idx in range(10):  # CIFAR-10有10个类别
+        class_indices[class_idx] = np.where(targets == class_idx)[0]
+
+    partitions = {i: [] for i in range(num_clients)}
+
+    # 为每个类别分配相同数量的样本到每个客户端
+    for class_idx in range(10):
+        np.random.shuffle(class_indices[class_idx])
+        samples_per_client_per_class = samples_per_client // 10  # 每个客户端每个类别的样本数
+
+        for client_idx in range(num_clients):
+            start_idx = client_idx * samples_per_client_per_class
+            end_idx = (client_idx + 1) * samples_per_client_per_class
+            partitions[client_idx].extend(class_indices[class_idx][start_idx:end_idx].tolist())
+
+    return partitions
+
+
+def create_overlapping_iid_partitions(train_dataset, num_clients=10, samples_per_client=180, overlap_ratio=0.3):
+    """创建有重叠的IID数据分区"""
+    targets = np.array(train_dataset.targets)
+    total_samples = len(train_dataset)
+
+    # 创建共享数据集（30%重叠）
+    shared_indices = np.random.choice(total_samples, size=int(total_samples * overlap_ratio), replace=False)
+    remaining_indices = list(set(range(total_samples)) - set(shared_indices))
+
+    partitions = {i: list(shared_indices) for i in range(num_clients)}  # 所有客户端共享部分数据
+
+    # 分配剩余数据
+    np.random.shuffle(remaining_indices)
+    samples_per_client_remaining = (samples_per_client - len(shared_indices)) // num_clients
+
+    for i in range(num_clients):
+        start_idx = i * samples_per_client_remaining
+        end_idx = (i + 1) * samples_per_client_remaining
+        partitions[i].extend(remaining_indices[start_idx:end_idx])
+
+    return partitions
+
+
+def create_whole_dataset(train_dataset, num_clients):
+    """为每个客户端分配所有数据"""
+    print(f"数据集大小: {len(train_dataset)}")
+
+    partitions = {i: [] for i in range(num_clients)}
+    for i in range(num_clients):
+        start_idx = 0
+        end_idx = len(train_dataset)
+        partitions[i].extend(range(start_idx, end_idx))
+
+    return partitions
+
 class SimpleClient:
     """简化版客户端，用于FedAvg测试"""
 
-    def __init__(self, cid, model, train_dataset, indices, device):
+    def __init__(self, cid, model, train_dataset, indices, device, test_loader=None):
         self.cid = cid
         self.model = model
         self.train_dataset = train_dataset
         self.indices = indices
         self.device = device
+        self.test_loader = test_loader
 
     def local_train(self, global_state, local_epochs=1, batch_size=32, lr=0.01, round_idx=None):
         """本地训练"""
@@ -61,8 +124,9 @@ class SimpleClient:
 
         # 每10轮降低学习率
         if round_idx is not None and round_idx > 0 and round_idx % 10 == 0:
+            current_lr = lr * (0.5 ** (round_idx // 10))
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr * (0.5 ** (round_idx // 10))
+                param_group['lr'] = current_lr
 
         # 训练循环
         for epoch in range(local_epochs):
@@ -75,11 +139,9 @@ class SimpleClient:
                 loss.backward()
                 optimizer.step()
 
-            val_loss = criterion(self.model(data), target)
-            print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
-
-        accuracy = test_model_accuracy(self.model, loader, self.device)
-        print(f"Client {self.cid}, Epoch {epoch}, Accuracy: {accuracy:.2f}%")
+        train_accuracy = test_model_accuracy(self.model, loader, self.device)
+        test_accuracy = test_model_accuracy(self.model, self.test_loader, self.device)
+        print(f"Client {self.cid}, Epoch {epoch}, Train Accuracy: {train_accuracy:.2f}%, Test Accuracy: {test_accuracy:.2f}%")
 
         # 返回更新后的模型状态
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -106,11 +168,11 @@ def test_model_accuracy(model, test_loader, device):
 def main():
     # 设置参数
     num_clients = 1
-    samples_per_client = 500
+    samples_per_client = 5000
     num_rounds = 1000
-    local_epochs = 10
+    local_epochs = 2
     batch_size = 128
-    lr = 0.1
+    lr = 0.05
 
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -121,7 +183,12 @@ def main():
     train_dataset, test_dataset = load_cifar10_data()
 
     # 创建数据分区
-    partitions = create_simple_partitions(train_dataset, num_clients, samples_per_client)
+    partitions = create_whole_dataset(
+        train_dataset, num_clients
+    )
+
+    # 创建测试数据加载器
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     # 初始化全局模型
     print("初始化ResNet-18模型...")
@@ -132,11 +199,8 @@ def main():
     clients = []
     for cid in range(num_clients):
         model = build_resnet18_cifar(num_classes=10, width_factor=1.0).to(device)
-        client = SimpleClient(cid, model, train_dataset, partitions[cid], device)
+        client = SimpleClient(cid, model, train_dataset, partitions[cid], device, test_loader)
         clients.append(client)
-
-    # 创建测试数据加载器
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     # 训练循环
     print(f"开始{num_rounds}轮联邦训练...")
@@ -183,7 +247,7 @@ def main():
         else:
             no_improvement_count += 1
 
-        if no_improvement_count >= patience and round_idx > 100:
+        if no_improvement_count >= patience and round_idx > 30:
             print(f"早停触发，连续{patience}轮没有改进")
             break
 
@@ -197,7 +261,7 @@ def main():
     os.makedirs('outputs/test_results', exist_ok=True)
     with open('outputs/test_results/fedavg_resnet_accuracy.txt', 'w') as f:
         f.write(f"FedAvg + ResNet-18 {num_rounds}轮训练结果\n")
-        f.write("=" * 50 + "\n")
+        f.write("=" * 18 + "\n")
         for i, acc in enumerate(accuracy_history):
             f.write(f"第 {i + 1} 轮: {acc:.2f}%\n")
         f.write(f"\n最终准确率: {accuracy_history[-1]:.2f}%\n")
