@@ -1,6 +1,7 @@
 import torch.nn as nn
 from torchvision.models import resnet18
 
+
 def build_resnet18_cifar(num_classes=10):
     model = resnet18(pretrained=False)
     # 适配小尺寸：7×7卷积→3×3，移除maxpool
