@@ -1,189 +1,61 @@
 import os
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+import numpy as np
+from torch.utils.data import DataLoader
+
+# FedLab imports
+from fedlab.utils.dataset.partition import CIFAR10Partitioner
+from fedlab.utils.functional import get_best_gpu
+from fedlab.core.standalone.trainer import ParallelTrainer
+from fedlab.core.client.handler import ClientTrainer
+from fedlab.core.server.handler import SyncServerHandler
+
+# torchvision for dataset and transforms
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import ToTensor, Normalize, Compose, transforms
+
+# 从项目中导入 ResNet 构建函数
 from src.training.models.resnet_cifar import build_resnet18_cifar
-from src.training.algorithms.fedavg import aggregate_fedavg
-from src.data.partition import cifar_iid_partitions, cifar_dirichlet_partitions, cifar_shards_partitions
-
-import torch.multiprocessing as mp
-from multiprocessing import Queue
-
-try:
-    mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass
 
 
-# ====================== Cutout数据增强 ======================
-class Cutout(object):
-    def __init__(self, length=8):
-        self.length = length
+# ===================================================================
+# 1. 自定义客户端训练处理器 (Client Handler)
+#    定义每个客户端如何执行本地训练。
+# ===================================================================
+class FedAvgClientTrainer(ClientTrainer):
+    def __init__(self, model, cuda=True, epochs=5, batch_size=128, lr=0.01):
+        super().__init__(model, cuda)
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
 
-    def __call__(self, img):
-        h, w = img.size(1), img.size(2)
-        mask = np.ones((h, w), np.float32)
-        y = np.random.randint(h)
-        x = np.random.randint(w)
-        y1 = np.clip(y - self.length // 2, 0, h)
-        y2 = np.clip(y + self.length // 2, 0, h)
-        x1 = np.clip(x - self.length // 2, 0, w)
-        x2 = np.clip(x + self.length // 2, 0, w)
-        mask[y1:y2, x1:x2] = 0.0
-        mask = torch.from_numpy(mask).expand_as(img)
-        img = img * mask
-        return img
-
-
-# ====================== 1. 数据加载 ======================
-def load_cifar10_data():
-    """加载CIFAR-10数据集"""
-    train_transform = Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomCrop(32, padding=4),
-        ToTensor(),
-        Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        Cutout(length=8)
-    ])
-
-    test_transform = Compose([
-        ToTensor(),
-        Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    ])
-
-    train_dataset = CIFAR10(root='../data', train=True, download=True, transform=train_transform)
-    test_dataset = CIFAR10(root='../data', train=False, download=True, transform=test_transform)
-
-    return train_dataset, test_dataset
-
-
-# ====================== 2. 客户端类 ======================
-class SimpleClient:
-    def __init__(self, cid, model, train_dataset, indices, device, test_loader=None):
-        self.cid = cid
-        self.model = model
-        self.train_dataset = train_dataset
-        self.indices = indices
-        self.device = device
-        self.test_loader = test_loader
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=0.001, weight_decay=5e-4
-        )
-        self.scheduler = None
-
-    def local_train(self, global_state, local_epochs=1, batch_size=32, lr=0.01, round_idx=None):
-        """本地训练（单客户端）"""
-        self.model.load_state_dict(global_state)
+    def train(self, model_parameters, train_loader):
+        self.model.load_state_dict(model_parameters)
         self.model.train()
-
-        subset = Subset(self.train_dataset, self.indices)
-        loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
-
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-
-        if self.scheduler is None:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=100, eta_min=1e-6
-            )
-
-        for epoch in range(local_epochs):
-            for batch_idx, (data, target) in enumerate(loader):
-                data, target = data.to(self.device), target.to(self.device)
+        for _ in range(self.epochs):
+            for data, target in train_loader:
+                if self.cuda:
+                    data, target = data.cuda(self.gpu), target.cuda(self.gpu)
 
                 self.optimizer.zero_grad()
                 output = self.model(data)
-                loss = criterion(output, target)
+                loss = self.criterion(output, target)
                 loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-        self.scheduler.step()
-
-        train_accuracy = test_model_accuracy(self.model, loader, self.device)
-        print(f"Client {self.cid} Train Accuracy: {train_accuracy:.2f}%")
-
-        return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        return self.model.state_dict()
 
 
-# ====================== 3. 并行训练函数 ======================
-def client_train_worker(client, global_state, local_epochs, batch_size, lr, round_idx, result_queue):
-    """客户端训练工作进程（用于多进程并行）"""
-    try:
-        # 执行本地训练
-        client_state = client.local_train(global_state, local_epochs, batch_size, lr, round_idx)
-        # 将结果放入队列（客户端ID + 模型状态 + 数据量）
-        result_queue.put((client.cid, client_state, len(client.indices)))
-        print(f"Client {client.cid} training completed, queue size: {result_queue.qsize()}")
-    except Exception as e:
-        print(f"Client {client.cid} training failed: {str(e)}")
-        try:
-            result_queue.put((client.cid, None, 0))
-        except:
-            pass
-
-
-def parallel_client_train(clients, selected_clients, global_state, local_epochs, batch_size, lr, round_idx, parallel_k):
-    # 初始化结果队列
-    result_queue = Queue()
-    processes = []
-    client_states = []
-    weights = []
-
-    # 分批次并行训练（每批最多parallel_k个客户端）
-    for i in range(0, len(selected_clients), parallel_k):
-        batch_clients = selected_clients[i:i + parallel_k]
-        batch_processes = []
-
-        # 为批次内的客户端创建进程
-        for cid in batch_clients:
-            client = clients[cid]
-            # 复制全局模型状态（避免进程间参数共享）
-            global_state_copy = {k: v.clone() for k, v in global_state.items()}
-            # 创建进程
-            p = mp.Process(
-                target=client_train_worker,
-                args=(client, global_state_copy, local_epochs, batch_size, lr, round_idx, result_queue)
-            )
-            p.daemon = True
-            batch_processes.append(p)
-            p.start()
-            print(f"Process {p.pid} started for client {cid}")
-
-        # 等待批次内进程完成
-        for p in batch_processes:
-            print(f"Process {p.pid} waiting")
-            p.join(timeout=60)  # 添加超时时间，避免无限等待
-            if p.is_alive():
-                print(f"Process {p.pid} timed out, terminating")
-                p.terminate()
-            print(f"Process {p.pid} completed")
-            processes.append(p)
-            print(f"Process {p.pid} completed for client {cid}")
-
-    # 从队列中收集结果
-    while not result_queue.empty():
-        print(f"Queue size: {result_queue.qsize()}")
-        cid, state, weight = result_queue.get()
-        if state is not None:
-            print(f"Received result for client {cid}, queue size: {result_queue.qsize()}")
-            client_states.append(state)
-            weights.append(weight)
-        else:
-            print(f"Client {cid} returned None state")
-
-    return client_states, weights
-
-
-# ====================== 4. 准确率测试 ======================
+# ===================================================================
+# 2. 准确率测试函数
+# ===================================================================
 def test_model_accuracy(model, test_loader, device):
     model.eval()
     correct = 0
     total = 0
-
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
@@ -191,100 +63,93 @@ def test_model_accuracy(model, test_loader, device):
             _, predicted = torch.max(outputs.data, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
-
     accuracy = 100 * correct / total
     return accuracy
 
 
-# ====================== 5. 主函数（调整参数+放宽早停） ======================
-def main():
-    # 设置参数
-    num_clients = 10
-    num_rounds = 100
-    local_epochs = 1
-    batch_size = 128
-    lr = 0.001
-    select_ratio = 0.1
-    client_parallelism = 1
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
-    print(f"并行训练客户端数: {client_parallelism}")
-
-    print("加载CIFAR-10数据集...")
-    train_dataset, test_dataset = load_cifar10_data()
-
-    partitions = cifar_iid_partitions(train_dataset, num_clients)
-
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-
-    print("初始化ResNet-18模型...")
-    global_model = build_resnet18_cifar(num_classes=10).to(device)
-    global_state = {k: v.detach().cpu().clone() for k, v in global_model.state_dict().items()}
-
-    # 创建客户端
-    clients = []
-    for cid in range(num_clients):
-        model = build_resnet18_cifar(num_classes=10).to(device)
-        client = SimpleClient(cid, model, train_dataset, partitions[cid], device, test_loader)
-        clients.append(client)
-
-    # 训练循环
-    print(f"开始{num_rounds}轮联邦训练（并行k={client_parallelism}）...")
-    accuracy_history = []
-    best_accuracy = 0.0
-    patience = 20  # 早停耐心值
-    no_improvement_count = 0
-
-    for round_idx in range(num_rounds):
-        # 随机选择60%的客户端参与本轮训练
-        selected_clients = np.random.choice(num_clients, int(num_clients * select_ratio), replace=False)
-        print(f"\n第 {round_idx + 1} 轮: 选中客户端 {selected_clients}")
-
-        # 并行执行客户端本地训练
-        client_states, weights = parallel_client_train(
-            clients, selected_clients, global_state,
-            local_epochs, batch_size, lr, round_idx, client_parallelism
-        )
-
-        # 服务器聚合
-        if client_states:
-            global_state = aggregate_fedavg(global_state, client_states, weights)
-
-        # 更新全局模型并测试准确率
-        global_model.load_state_dict(global_state)
-        accuracy = test_model_accuracy(global_model, test_loader, device)
-        accuracy_history.append(accuracy)
-
-        print(f"第 {round_idx + 1} 轮准确率: {accuracy:.2f}%")
-
-        # 早停机制
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            no_improvement_count = 0
-            os.makedirs('outputs/test_results', exist_ok=True)
-            torch.save(global_state, 'outputs/test_results/best_fedavg_model.pth')
-        else:
-            no_improvement_count += 1
-
-        if no_improvement_count >= patience and round_idx > 30:
-            print(f"早停触发，连续{patience}轮没有改进")
-            break
-
-    print(f"\n=== 训练完成 ===")
-    print(f"最终准确率: {accuracy_history[-1]:.2f}%")
-    print(f"最佳准确率: {max(accuracy_history):.2f}%")
-    print(f"准确率历史: {[f'{acc:.2f}%' for acc in accuracy_history]}")
-
-    os.makedirs('outputs/test_results', exist_ok=True)
-    with open('outputs/test_results/fedavg_accuracy.txt', 'w') as f:
-        f.write(f"FedAvg + ResNet-18 {num_rounds}轮训练结果\n")
-        f.write("=" * 18 + "\n")
-        for i, acc in enumerate(accuracy_history):
-            f.write(f"第 {i + 1} 轮: {acc:.2f}%\n")
-        f.write(f"\n最终准确率: {accuracy_history[-1]:.2f}%\n")
-        f.write(f"最佳准确率: {max(accuracy_history):.2f}%\n")
-
-
+# ===================================================================
+# 3. 主执行逻辑
+# ===================================================================
 if __name__ == "__main__":
-    main()
+    # 超参数设置
+    NUM_ROUNDS = 50
+    NUM_CLIENTS = 100
+    NUM_PER_ROUND = 4  # 每轮并行计算的客户端数量
+    LOCAL_EPOCHS = 5
+    BATCH_SIZE = 128
+    LR = 0.01
+
+    # 检查并设置设备
+    device = get_best_gpu() if torch.cuda.is_available() else "cpu"
+    print(f"使用设备: {device}")
+
+    # 1. 准备模型和数据
+    # 直接从项目中导入模型
+    model = build_resnet18_cifar(num_classes=10)
+
+    # 数据集和变换
+    transform = Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        ToTensor(),
+        Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+    test_transform = Compose([
+        ToTensor(),
+        Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    # 使用 FedLab 的 Partitioner 来划分数据
+    # 这里我们使用 Dirichlet 分布来模拟 Non-IID 数据，更贴近真实场景
+    data_dir = '../data'
+    partitioner = CIFAR10Partitioner(
+        CIFAR10(root=data_dir, train=True, download=True, transform=transform),
+        num_clients=NUM_CLIENTS,
+        partition="dirichlet",
+        dir_alpha=0.4,
+        seed=42
+    )
+
+    test_dataset = CIFAR10(root=data_dir, train=False, download=True, transform=test_transform)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+
+    # 2. 设置 FedLab 的 Server 和 Client 处理器
+    server_handler = SyncServerHandler(
+        model=model,
+        global_round=NUM_ROUNDS,
+    )
+
+    client_handler = FedAvgClientTrainer(
+        model=model,
+        epochs=LOCAL_EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LR,
+        cuda=True if device != "cpu" else False
+    )
+    # 将数据集与客户端处理器关联
+    client_handler.setup_dataset(partitioner)
+
+    # 3. 设置并行训练器
+    # num_workers 就是并行进程的数量
+    trainer = ParallelTrainer(
+        server_handler=server_handler,
+        client_handler=client_handler,
+        num_workers=NUM_PER_ROUND  # 核心：设置并行工作进程数为4
+    )
+
+    # 4. 开始训练循环
+    print(f"开始 {NUM_ROUNDS} 轮联邦训练，每轮并行 {NUM_PER_ROUND} 个客户端...")
+    for round_idx in range(NUM_ROUNDS):
+        # 随机选择本轮参与的客户端
+        selected_clients = np.random.choice(NUM_CLIENTS, NUM_PER_ROUND, replace=False)
+
+        # 启动单轮训练
+        trainer.train(client_ids=list(selected_clients))
+
+        # 在服务器端测试全局模型准确率
+        # trainer.model 就是聚合后的全局模型
+        accuracy = test_model_accuracy(trainer.model, test_loader, device)
+
+        print(f"第 {round_idx + 1}/{NUM_ROUNDS} 轮 | 全局模型准确率: {accuracy:.2f}%")
+
+    print("\n=== 训练完成 ===")
