@@ -1,0 +1,70 @@
+dataset:
+  name: cifar10
+  root: data
+  download: false
+  use_fake_if_unavailable: false
+  noniid:
+    type: dirichlet
+    alpha: 0.5
+    label_bias_classes_per_client: 2
+    quantity_bias_sigma: 0.8
+  quick_samples: null
+model:
+  type: resnet18_cifar
+  width_factor: 1.0
+clients:
+  num_clients: 50
+  samples_per_client: 500
+  selection_top_k: 20
+  sliding_window: 8
+  hysteresis: 0.05
+wireless:
+  block_fading_intensity: 1.0
+  base_snr_db: 15.0
+  per_k: 0.8
+  bandwidth_budget_mb_per_round: 50.0
+  tx_power_watts: 1.5
+  compute_power_watts: 12.0
+  compute_rate_samples_per_sec: 4000
+  channel_model: tr38901_umi
+  carrier_ghz: 3.5
+training:
+  algorithm: fedavg
+  local_epochs: 2
+  batch_size: 64
+  lr: 0.5
+  momentum: 0.9
+  sync: true
+  sync_mode: semi_sync
+  semi_sync_wait_ratio: 0.8
+  fedprox_mu: 0.01
+  scaffold: true
+  fedbuff:
+    enabled: true
+    buffer_size: 64
+    staleness_alpha: 1.0
+    max_staleness: 8
+    async_agg_interval: 2
+    min_updates_to_aggregate: 16
+compression:
+  quantization_8bit: true
+  topk_fraction: 0.1
+  error_feedback: true
+scheduling:
+  weights:
+    energy: 0.25
+    channel: 0.25
+    data_value: 0.25
+    fairness_debt: 0.05
+    bandwidth_cost: -0.2
+  fairness_ledger:
+    debt_increase: 0.05
+    repay_rate: 0.1
+    max_debt: 1.0
+eval:
+  rounds: 100
+  test_interval: 2
+  seed: 2025
+  save_csv: true
+  save_plots: true
+  preference: time
