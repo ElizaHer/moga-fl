@@ -29,9 +29,8 @@ class Cutout(object):
         return img
 
 
-# ====================== 1. 数据加载（增加Cutout） ======================
+# ====================== 1. 数据加载（增加Cutout�?======================
 def load_cifar10_data():
-    """加载CIFAR-10数据集（对齐增强策略）"""
     train_transform = Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomCrop(32, padding=4),
@@ -52,15 +51,14 @@ def load_cifar10_data():
 
 
 def create_whole_dataset(train_dataset):
-    print(f"数据集大小: {len(train_dataset)}")
+    print(f"数据集大�? {len(train_dataset)}")
     return range(0, len(train_dataset))
 
 
-# ====================== 2. 适配ResNet-18（替换原有build函数） ======================
+# ====================== 2. 适配ResNet-18======================
 def build_resnet18_cifar(num_classes=10):
-    """对齐模型结构：移除dropout，适配小尺寸数据集"""
-    model = resnet18(pretrained=False)
-    # 适配小尺寸：7×7卷积→3×3，移除maxpool
+    model = resnet18(weights=None)
+    # 适配小尺寸：7×7卷积�?×3，移除maxpool
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     # 调整全连接层
@@ -70,7 +68,7 @@ def build_resnet18_cifar(num_classes=10):
     return model
 
 
-# ====================== 3. 客户端训练（修复调度器+增加标签平滑+梯度裁剪） ======================
+# ====================== 3. 客户端训练（修复调度�?增加标签平滑+梯度裁剪�?======================
 class SimpleClient:
     def __init__(self, model, train_dataset, indices, device, test_loader=None):
         self.model = model
@@ -94,7 +92,7 @@ class SimpleClient:
         # 带标签平滑的损失函数
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-        # 初始化调度器（仅第一次调用时）
+        # 初始化调度器（仅第一次调用时�?
         if self.scheduler is None:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=100, eta_min=1e-6
@@ -115,7 +113,7 @@ class SimpleClient:
 
                 self.optimizer.step()
 
-        # 调度器在每轮全局训练后更新（而非local epoch）
+        # 调度器在每轮全局训练后更新（而非local epoch�?
         self.scheduler.step()
 
         train_accuracy = test_model_accuracy(self.model, loader, self.device)
@@ -124,7 +122,7 @@ class SimpleClient:
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
 
 
-# ====================== 4. 准确率测试 ======================
+# ====================== 4. 准确率测�?======================
 def test_model_accuracy(model, test_loader, device):
     model.eval()
     correct = 0
@@ -142,19 +140,19 @@ def test_model_accuracy(model, test_loader, device):
     return accuracy
 
 
-# ====================== 5. 主函数（调整参数+放宽早停） ======================
+# ====================== 5. 主函数（调整参数+放宽早停�?======================
 def main():
     # 对齐参数
     num_clients = 1
     num_rounds = 100  # 对应100个epoch
-    local_epochs = 1  # 保持1（联邦学习单轮1个local epoch）
+    local_epochs = 1  # 保持1（联邦学习单�?个local epoch�?
     batch_size = 128
-    lr = 0.001  # 对齐学习率
+    lr = 0.001  # 对齐学习�?
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
 
-    print("加载CIFAR-10数据集...")
+    print("加载CIFAR-10数据�?..")
     train_dataset, test_dataset = load_cifar10_data()
 
     partitions = create_whole_dataset(train_dataset)
@@ -165,10 +163,10 @@ def main():
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     client = SimpleClient(model, train_dataset, partitions, device, test_loader)
 
-    print(f"开始{num_rounds}轮训练...")
+    print(f"开始{num_rounds}轮训�?..")
     accuracy_history = []
     best_accuracy = 0.0
-    patience = 50  # 早停耐心值
+    patience = 50  # 早停耐心�?
     no_improvement_count = 0
 
     for round_idx in range(num_rounds):
@@ -180,7 +178,7 @@ def main():
         accuracy = test_model_accuracy(model, test_loader, device)
         accuracy_history.append(accuracy)
 
-        print(f"第 {round_idx + 1} 轮准确率: {accuracy:.2f}%")
+        print(f"�?{round_idx + 1} 轮准确率: {accuracy:.2f}%")
 
         if accuracy > best_accuracy:
             best_accuracy = accuracy
@@ -190,9 +188,8 @@ def main():
         else:
             no_improvement_count += 1
 
-        # 调整早停触发条件：至少训练60轮后再判断
         if no_improvement_count >= patience and round_idx > 60:
-            print(f"早停触发，连续{patience}轮没有改进")
+            print(f"早停触发，连续{patience}轮没有善")
             break
 
     print(f"\n=== 训练完成 ===")
@@ -204,7 +201,7 @@ def main():
         f.write(f"ResNet-18 {num_rounds}轮训练结果\n")
         f.write("=" * 18 + "\n")
         for i, acc in enumerate(accuracy_history):
-            f.write(f"第 {i + 1} 轮: {acc:.2f}%\n")
+            f.write(f"�?{i + 1} �? {acc:.2f}%\n")
         f.write(f"\n最终准确率: {accuracy_history[-1]:.2f}%\n")
         f.write(f"最佳准确率: {max(accuracy_history):.2f}%\n")
 
