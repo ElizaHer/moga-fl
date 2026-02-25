@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import ToTensor, Normalize, Compose, transforms
-from torchvision.models import resnet18
+from src.training.models.resnet_cifar import build_resnet18_cifar
 
 
 # ====================== Cutout数据增强 ======================
@@ -51,21 +51,8 @@ def load_cifar10_data():
 
 
 def create_whole_dataset(train_dataset):
-    print(f"数据集大�? {len(train_dataset)}")
+    print(f"数据集大小: {len(train_dataset)}")
     return range(0, len(train_dataset))
-
-
-# ====================== 2. 适配ResNet-18======================
-def build_resnet18_cifar(num_classes=10):
-    model = resnet18(weights=None)
-    # 适配小尺寸：7×7卷积�?×3，移除maxpool
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    # 调整全连接层
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
-    # 移除dropout（原代码的dropout=0.5会导致精度下降）
-    return model
 
 
 # ====================== 3. 客户端训练（修复调度�?增加标签平滑+梯度裁剪�?======================
@@ -122,7 +109,7 @@ class SimpleClient:
         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
 
 
-# ====================== 4. 准确率测�?======================
+# ====================== 4. 准确率测测试======================
 def test_model_accuracy(model, test_loader, device):
     model.eval()
     correct = 0
@@ -140,10 +127,8 @@ def test_model_accuracy(model, test_loader, device):
     return accuracy
 
 
-# ====================== 5. 主函数（调整参数+放宽早停�?======================
+# ====================== 5. 主函数======================
 def main():
-    # 对齐参数
-    num_clients = 1
     num_rounds = 100  # 对应100个epoch
     local_epochs = 1  # 保持1（联邦学习单�?个local epoch�?
     batch_size = 128

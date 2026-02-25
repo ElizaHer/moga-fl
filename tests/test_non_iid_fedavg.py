@@ -10,15 +10,7 @@ from flwr.common import Context, NDArrays, Scalar
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, RandomCrop, RandomHorizontalFlip, ToTensor
-
-
-def build_resnet18_cifar(num_classes: int = 10) -> nn.Module:
-    from torchvision.models import resnet18
-
-    model = resnet18(num_classes=num_classes)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    return model
+from src.training.models.resnet_cifar import build_resnet18_cifar
 
 
 def get_parameters(model: nn.Module) -> NDArrays:
