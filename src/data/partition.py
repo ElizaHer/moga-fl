@@ -4,6 +4,16 @@ from collections import defaultdict
 from fedlab.utils.dataset import CIFAR10Partitioner, MNISTPartitioner
 
 
+def iid_partition_indices(
+    num_samples: int, num_clients: int, seed: int
+) -> List[List[int]]:
+    rng = np.random.default_rng(seed)
+    indices = np.arange(num_samples)
+    rng.shuffle(indices)
+    splits = np.array_split(indices, num_clients)
+    return [split.tolist() for split in splits]
+
+
 def cifar_iid_partitions(train_dataset, num_clients=10):
     partitioner = CIFAR10Partitioner(
         targets=np.array(train_dataset.targets),  # 传入标签数组

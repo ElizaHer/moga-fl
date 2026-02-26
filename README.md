@@ -41,6 +41,11 @@
 pip install -r requirements.txt
 ```
 
+安装项目（ editable 模式）：
+```
+pip install -e .
+```
+
 ## 快速开始（单机可复现，≤5分钟）
 - 使用“快速模式”与 FakeData 回退（若无法联网下载数据）生成样例结果：
 ```
