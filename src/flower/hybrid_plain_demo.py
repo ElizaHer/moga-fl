@@ -483,7 +483,7 @@ def run_hybrid_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
         num_clients=cfg.num_clients,
         config=fl.server.ServerConfig(num_rounds=cfg.num_rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.25},
+        client_resources={"num_cpus": 2, "num_gpus": 0.25},
         ray_init_args={"include_dashboard": False},
     )
     return {

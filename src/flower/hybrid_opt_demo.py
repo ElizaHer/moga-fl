@@ -1,21 +1,9 @@
-# fixed_hybrid_demo.py
-# 与 docs/algorithms_explained.md 的主要对齐点：
-# - 实现门控切换策略（gate_score + semi_sync/async/bridge 状态机）
-# - 使用滑动窗口的 avg_per/Jain/能耗统计，并输出 bandwidth_factor∈[0.8,1.0]
-# - 支持 FedBuff 异步缓冲与基于陈旧度的加权聚合
-# - 在 configure_fit 中按“信道/数据量/公平债务/能耗/带宽成本”打分并做 Top-K 调度
-# - 在 semi_sync/bridge 模式下使用 semi_sync_wait_ratio 的发送时间分位数实现半同步等待
-# - 客户端可选叠加 FedProx 正则项（fedprox_mu>0 时生效）
-# - 每轮输出 round/mode/accuracy/loss/avg_per/jain/energy/bw_factor/topk 到 outputs/hybrid_metrics.csv
-# 仍然存在的差异/简化：
-# - 未实现 SCAFFOLD 与控制变元相关逻辑
-# - 无线信道/能耗/带宽建模为轻量近似版，未实现完整 TR 38.901/DeepMIMO 等复杂模型
-# - 未集成 MOGA-FL 多目标遗传搜索，仅保留手工配置的调度权重
-
 from __future__ import annotations
 
 import argparse
 import csv
+import datetime
+import io
 import os
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -41,124 +29,18 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, RandomCrop, RandomHorizontalFlip, ToTensor
 
-
-# -----------------------------
-# 可选模型与无线模块导入（失败则使用轻量实现）
-# -----------------------------
-
-try:  # 优先使用仓库中的 ResNet18 实现
-    from src.training.models.resnet_cifar import build_resnet18_cifar  # type: ignore
-except Exception:  # 降级为简单 CNN
-
-    class _SimpleCifarCNN(nn.Module):
-        def __init__(self, num_classes: int = 10) -> None:
-            super().__init__()
-            self.features = nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=3, padding=1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((1, 1)),
-            )
-            self.classifier = nn.Linear(128, num_classes)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-            x = self.features(x)
-            x = x.view(x.size(0), -1)
-            return self.classifier(x)
-
-    def build_resnet18_cifar(num_classes: int = 10) -> nn.Module:  # type: ignore[override]
-        return _SimpleCifarCNN(num_classes=num_classes)
-
-
-try:  # 优先使用仓库中的无线模块
-    from src.wireless.channel import ChannelSimulator  # type: ignore
-except Exception:
-
-    class ChannelSimulator:  # type: ignore[misc]
-        """简化版信道模拟器.
-
-        sample_round() 返回 {cid: {"snr_db": float, "per": float}}，
-        其中 per≈sigmoid(-snr_db/8)，裁剪到 [0,1]。
-        """
-
-        def __init__(self, wireless_cfg: Dict[str, object], num_clients: int) -> None:
-            del wireless_cfg
-            self.num_clients = num_clients
-            self.rng = np.random.default_rng(2026)
-
-        def sample_round(self) -> Dict[int, Dict[str, float]]:
-            stats: Dict[int, Dict[str, float]] = {}
-            for cid in range(self.num_clients):
-                snr_db = float(np.clip(self.rng.normal(loc=8.0, scale=4.0), -5.0, 25.0))
-                # per ≈ sigmoid(-snr_db/8)
-                per = float(np.clip(1.0 / (1.0 + np.exp(snr_db / 8.0)), 0.0, 1.0))
-                stats[cid] = {"snr_db": snr_db, "per": per}
-            return stats
-
-
-try:
-    from src.wireless.bandwidth import BandwidthAllocator  # type: ignore
-except Exception:
-
-    class BandwidthAllocator:  # type: ignore[misc]
-        """简化版带宽分配：对选中客户端平均分配总预算。"""
-
-        def __init__(self, wireless_cfg: Dict[str, object]) -> None:
-            wireless = wireless_cfg.get("wireless", {})
-            if isinstance(wireless, dict):
-                self.budget_mb: float = float(wireless.get("bandwidth_budget_mb_per_round", 12.0))
-            else:
-                self.budget_mb = 12.0
-
-        def allocate_uniform(self, cids: List[int]) -> Dict[int, float]:
-            if not cids or self.budget_mb <= 0.0:
-                return {cid: 0.0 for cid in cids}
-            share = self.budget_mb / float(len(cids))
-            return {cid: share for cid in cids}
-
-        def estimate_tx_time(self, payload_mb: float, allocated_mb: float) -> float:
-            if allocated_mb <= 0.0:
-                return float("inf")
-            return float(payload_mb) / float(max(allocated_mb, 1e-12))
-
-
-try:
-    from src.wireless.energy import EnergyEstimator  # type: ignore
-except Exception:
-
-    class EnergyEstimator:  # type: ignore[misc]
-        """简化版能耗估计：comm_energy≈tx_time*tx_power, compute_energy≈(N/compute_rate)*compute_power."""
-
-        def __init__(self, wireless_cfg: Dict[str, object]) -> None:
-            wireless = wireless_cfg.get("wireless", {})
-            if isinstance(wireless, dict):
-                self.tx_power_watts = float(wireless.get("tx_power_watts", 1.0))
-                self.compute_power_watts = float(wireless.get("compute_power_watts", 8.0))
-                self.compute_rate = float(wireless.get("compute_rate_samples_per_sec", 2000.0))
-            else:
-                self.tx_power_watts = 1.0
-                self.compute_power_watts = 8.0
-                self.compute_rate = 2000.0
-
-        def comm_energy(self, tx_time: float) -> float:
-            return float(tx_time) * self.tx_power_watts
-
-        def compute_energy(self, num_examples: int) -> float:
-            compute_time = float(num_examples) / max(self.compute_rate, 1e-12)
-            return compute_time * self.compute_power_watts
+from src.training.algorithms.fedprox import fedprox_regularizer
+from src.training.algorithms.scaffold import ScaffoldState
+from src.training.models.resnet_cifar import build_resnet18_cifar  # type: ignore
+from src.wireless.channel import ChannelSimulator  # type: ignore
+from src.wireless.bandwidth import BandwidthAllocator  # type: ignore
+from src.wireless.energy import EnergyEstimator  # type: ignore
 
 
 # -----------------------------
 # 配置与工具函数
 # -----------------------------
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 @dataclass
@@ -172,7 +54,7 @@ class HybridCifarConfig:
     alpha: float = 0.5
     fraction_fit: float = 0.5
     seed: int = 42
-    data_dir: str = "./data"
+    data_dir: str = f"{project_root}/data"
 
     # 半同步与异步
     semi_sync_wait_ratio: float = 0.7
@@ -206,6 +88,7 @@ class HybridCifarConfig:
 
     # FedProx
     fedprox_mu: float = 0.0
+    algorithm: str = "fedavg"  # fedavg / fedprox / scaffold
 
     # 策略嵌套配置（与 docs 一致的层级）
     strategy: Dict[str, object] = field(
@@ -215,8 +98,8 @@ class HybridCifarConfig:
             "hysteresis_margin": 0.03,
             "bridge_rounds": 2,
             "min_rounds_between_switch": 2,
-            "gate_weights": {"per": 0.5, "fairness": 0.3, "energy": 0.2},
-            "bandwidth_rebalance": {"low": 0.8, "high": 1.0},
+            "gate_weights": {"per": 0.3, "fairness": 0.4, "energy": 0.3},
+            "bandwidth_rebalance": {"low_energy_factor": 0.8, "high_energy_factor": 1.0},
             "scheduling": {
                 "weights": {
                     "channel_w": 0.25,
@@ -254,6 +137,29 @@ def set_parameters(model: nn.Module, parameters: NDArrays) -> None:
         {key: torch.tensor(value) for key, value in zip(model.state_dict().keys(), parameters)}
     )
     model.load_state_dict(state_dict, strict=True)
+
+
+def _global_state_from_ndarrays(model: nn.Module, parameters: NDArrays, device: torch.device) -> Dict[str, torch.Tensor]:
+    keys = list(model.state_dict().keys())
+    return {
+        k: torch.tensor(v, device=device)
+        for k, v in zip(keys, parameters)
+    }
+
+
+def _pack_tensor_dict(tensors: Dict[str, torch.Tensor]) -> bytes:
+    buffer = io.BytesIO()
+    cpu_state = {k: v.detach().cpu() for k, v in tensors.items()}
+    torch.save(cpu_state, buffer)
+    return buffer.getvalue()
+
+
+def _unpack_tensor_dict(payload: bytes, device: torch.device) -> Dict[str, torch.Tensor]:
+    if not payload:
+        return {}
+    buffer = io.BytesIO(payload)
+    obj = torch.load(buffer, map_location=device)
+    return {k: v.to(device) for k, v in obj.items()}
 
 
 def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.device) -> Tuple[float, float]:
@@ -423,8 +329,8 @@ class ModeController:
         self.w_fair = float(gate_weights.get("fairness", cfg.w_fair))
         self.w_energy = float(gate_weights.get("energy", cfg.w_energy))
 
-        self.bw_low = float(bw_cfg.get("low", 0.8))
-        self.bw_high = float(bw_cfg.get("high", 1.0))
+        self.bw_low = float(bw_cfg.get("low_energy_factor", 0.8))
+        self.bw_high = float(bw_cfg.get("high_energy_factor", 1.0))
 
         self.history: Deque[Dict[str, float]] = deque(maxlen=self.window_size)
         self.current_mode: str = "semi_sync"
@@ -459,6 +365,7 @@ class ModeController:
             + self.w_fair * fairness_deficit
             + self.w_energy * energy_norm
         )
+        print(f"avg_per: {avg_per:.4f}, fairness: {fairness_deficit:.4f}, energy: {energy_norm:.4f}, score: {score:.4f}")
         return float(score)
 
     def _bandwidth_factor(self) -> float:
@@ -511,7 +418,7 @@ class ModeController:
 
 
 # -----------------------------
-# 客户端实现（支持 FedProx）
+# 客户端实现
 # -----------------------------
 
 
@@ -535,6 +442,7 @@ class CifarClient(fl.client.NumPyClient):  # type: ignore[misc]
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=100, eta_min=1e-6
         )
+        self.scaffold_ci: Dict[str, torch.Tensor] | None = None
 
     def get_parameters(self, config: Dict[str, Scalar]) -> NDArrays:  # type: ignore[override]
         del config
@@ -544,35 +452,67 @@ class CifarClient(fl.client.NumPyClient):  # type: ignore[misc]
         self, parameters: NDArrays, config: Dict[str, Scalar]
     ) -> Tuple[NDArrays, int, Dict[str, Scalar]]:  # type: ignore[override]
         set_parameters(self.model, parameters)
+        algo = str(config.get("algorithm", "fedavg")).lower()
         mu = float(config.get("fedprox_mu", 0.0))
         criterion = nn.CrossEntropyLoss()
+        global_state = _global_state_from_ndarrays(self.model, parameters, self.device)
+        delta_ci_bytes = b""
 
-        # FedProx: 记录全局参数 w_global
-        global_params: Optional[List[torch.Tensor]] = None
-        if mu > 0.0:
-            global_params = [p.detach().clone().to(self.device) for p in self.model.parameters()]
+        # SCAFFOLD: 读取 c_global，若首次出现则初始化本地 c_i
+        c_global: Dict[str, torch.Tensor] = {}
+        if algo == "scaffold":
+            c_global = _unpack_tensor_dict(bytes(config.get("scaffold_c_global", b"")), self.device)
+            if self.scaffold_ci is None:
+                self.scaffold_ci = {k: torch.zeros_like(v) for k, v in c_global.items()}
 
         self.model.train()
+        num_steps = 0
         for _ in range(self.local_epochs):
             for images, labels in self.trainloader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
                 logits = self.model(images)
                 loss = criterion(logits, labels)
-
-                if mu > 0.0 and global_params is not None:
-                    prox_reg = torch.zeros(1, device=self.device)
-                    for p, g in zip(self.model.parameters(), global_params):
-                        prox_reg = prox_reg + torch.sum((p - g) ** 2)
-                    loss = loss + 0.5 * mu * prox_reg
+                if algo == "fedprox" and mu > 0.0:
+                    loss = loss + fedprox_regularizer(self.model, global_state, mu, self.device)
 
                 loss.backward()
+                if algo == "scaffold" and self.scaffold_ci is not None:
+                    # SCAFFOLD 梯度校正: grad <- grad + (c_i - c_global)
+                    for name, p in self.model.named_parameters():
+                        if p.grad is None:
+                            continue
+                        ci = self.scaffold_ci.get(name)
+                        cg = c_global.get(name)
+                        if ci is not None and cg is not None:
+                            p.grad.data = p.grad.data + (ci - cg)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
+                num_steps += 1
 
-        return get_parameters(self.model), len(self.trainloader.dataset), {"cid": float(self.cid)}
+        if algo == "scaffold" and self.scaffold_ci is not None:
+            local_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+            lr = float(self.optimizer.param_groups[0].get("lr", 0.001))
+            scale = 1.0 / max(1, int(num_steps)) / max(1e-8, lr)
+            delta_ci: Dict[str, torch.Tensor] = {}
+            new_ci: Dict[str, torch.Tensor] = {}
+            for k in c_global.keys():
+                old_ci = self.scaffold_ci[k]
+                w_g = global_state[k]
+                w_l = local_state[k].to(self.device)
+                c_g = c_global[k]
+                ci_new = old_ci - c_g + (w_g - w_l) * scale
+                delta_ci[k] = ci_new - old_ci
+                new_ci[k] = ci_new
+            self.scaffold_ci = new_ci
+            delta_ci_bytes = _pack_tensor_dict(delta_ci)
+
+        return get_parameters(self.model), len(self.trainloader.dataset), {
+            "cid": float(self.cid),
+            "delta_ci": delta_ci_bytes,
+        }
 
     def evaluate(
         self, parameters: NDArrays, config: Dict[str, Scalar]
@@ -620,6 +560,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self._base_bandwidth_budget: Optional[float] = float(base_budget) if base_budget is not None else None
 
         self.global_params_cache: Optional[Parameters] = None
+        self.scaffold_state: Optional[ScaffoldState] = None
 
         # 调度和公平性统计
         self.selection_window: Deque[List[int]] = deque(maxlen=self.cfg.fair_window_size)
@@ -650,7 +591,9 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.jain_history: List[float] = []
 
         # metrics.csv
-        self.metrics_path = os.path.join("outputs", "hybrid_metrics.csv")
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.metrics_path = os.path.join("outputs/hybrid_metrics", f"{self.cfg.algorithm}_{current_time}.csv")
+        print(f"Result file: {self.metrics_path}")
         self._init_metrics_file()
 
     # --- 工具方法 ---
@@ -751,6 +694,9 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         model = build_resnet18_cifar()
         ndarrays = get_parameters(model)
         self.global_params_cache = ndarrays_to_parameters(ndarrays)
+        if self.cfg.algorithm.lower() == "scaffold":
+            global_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            self.scaffold_state = ScaffoldState(global_state)
         return self.global_params_cache
 
     def configure_fit(
@@ -787,30 +733,26 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             )
             available_list = list(sampled_clients)
 
-        cid_to_client: Dict[int, object] = {}
-        for client in available_list:
-            cid_attr = getattr(
-                client,
-                "cid",
-                getattr(client, "client_id", getattr(client, "node_id", getattr(client, "id", None))),
-            )
-            if cid_attr is None:
-                continue
-            try:
-                cid_int = int(cid_attr)
-            except Exception:
-                continue
-            if 0 <= cid_int < self.cfg.num_clients:
-                cid_to_client[cid_int] = client
+        cid_to_client: Dict[int, object] = {i: available_list[i] for i in range(self.cfg.num_clients)}
 
         if not cid_to_client:
             # 回退为随机采样
+            print(f"Warning: No valid cid found for {top_k} clients. Falling back to random sampling.")
             clients = client_manager.sample(
                 num_clients=max(1, top_k),
                 min_num_clients=max(1, top_k),
             )
-            fit_ins = FitIns(parameters, {"server_round": float(server_round), "fedprox_mu": float(self.cfg.fedprox_mu)})
+            fit_cfg: Dict[str, Scalar] = {
+                "server_round": float(server_round),
+                "fedprox_mu": float(self.cfg.fedprox_mu),
+                "algorithm": str(self.cfg.algorithm),
+            }
+            if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
+                fit_cfg["scaffold_c_global"] = _pack_tensor_dict(self.scaffold_state.c_global)
+            fit_ins = FitIns(parameters, fit_cfg)
             return [(client, fit_ins) for client in clients]
+        
+        print(f"selection window size: {len(self.selection_window)}")
 
         # 4) 信道抽样 + 带宽预算更新
         self.current_wireless_stats = self.channel.sample_round()
@@ -874,7 +816,14 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                 num_clients=max(1, top_k),
                 min_num_clients=max(1, top_k),
             )
-            fit_ins = FitIns(parameters, {"server_round": float(server_round), "fedprox_mu": float(self.cfg.fedprox_mu)})
+            fit_cfg: Dict[str, Scalar] = {
+                "server_round": float(server_round),
+                "fedprox_mu": float(self.cfg.fedprox_mu),
+                "algorithm": str(self.cfg.algorithm),
+            }
+            if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
+                fit_cfg["scaffold_c_global"] = _pack_tensor_dict(self.scaffold_state.c_global)
+            fit_ins = FitIns(parameters, fit_cfg)
             return [(client, fit_ins) for client in clients]
 
         candidates_sorted = sorted(candidates, key=lambda cid: scores[cid], reverse=True)
@@ -885,10 +834,15 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         # 更新滑窗选择历史（供 Jain 和公平债务使用）
         self.selection_window.append(list(selected_cids))
 
-        fit_ins = FitIns(
-            parameters,
-            {"server_round": float(server_round), "fedprox_mu": float(self.cfg.fedprox_mu)},
-        )
+        fit_cfg: Dict[str, Scalar] = {
+            "server_round": float(server_round),
+            "fedprox_mu": float(self.cfg.fedprox_mu),
+            "algorithm": str(self.cfg.algorithm),
+        }
+        if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
+            fit_cfg["scaffold_c_global"] = _pack_tensor_dict(self.scaffold_state.c_global)
+        fit_ins = FitIns(parameters, fit_cfg)
+        print(f"selected cids: {selected_cids}")
         return [(cid_to_client[cid], fit_ins) for cid in selected_cids]
 
     def aggregate_fit(self, server_round: int, results, failures):  # type: ignore[override]
@@ -903,6 +857,8 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             # 回退：以本轮实际返回的 cid 作为调度集合
             scheduled_cids = [int(res.metrics.get("cid", -1)) for _, res in results]
             scheduled_cids = [cid for cid in scheduled_cids if 0 <= cid < self.cfg.num_clients]
+
+        print(f"selected cids: {scheduled_cids}")
 
         wireless_stats = self.current_wireless_stats or self.channel.sample_round()
 
@@ -934,6 +890,8 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             )
 
         valid_sync_updates: List[Tuple[List[np.ndarray], float]] = []
+        scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
+        scaffold_weights: Dict[int, float] = {}
         round_energy = 0.0
 
         for _, fit_res in results:
@@ -960,6 +918,14 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
 
             ndarrays = parameters_to_ndarrays(fit_res.parameters)
             weight = float(num_examples)
+
+            if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
+                payload = fit_res.metrics.get("delta_ci", b"")
+                if isinstance(payload, (bytes, bytearray)) and len(payload) > 0:
+                    delta_ci = _unpack_tensor_dict(bytes(payload), torch.device("cpu"))
+                    if delta_ci:
+                        scaffold_deltas[cid] = delta_ci
+                        scaffold_weights[cid] = weight
 
             # 异步路径：所有未丢包更新进入 FedBuff
             self.fedbuff.push(ndarrays, num_examples)
@@ -998,6 +964,9 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                     merged.append(s)
 
         self.global_params_cache = ndarrays_to_parameters(merged)
+
+        if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None and scaffold_deltas:
+            self.scaffold_state.update_global(scaffold_deltas, scaffold_weights)
 
         # 评估全局模型
         set_parameters(self.model_for_eval, merged)
@@ -1101,7 +1070,7 @@ def run_hybrid_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
 
     def client_fn(context: Context) -> fl.client.Client:
         cid = int(context.node_config.get("partition-id", context.node_id))
-        return CifarClient(cid, trainloaders[cid], testloader, cfg.local_epochs, cfg.lr)
+        return CifarClient(cid, trainloaders[cid], testloader, cfg.local_epochs, cfg.lr).to_client()
 
     strategy = HybridWirelessStrategy(cfg, partition_sizes, testloader)
 
@@ -1110,7 +1079,7 @@ def run_hybrid_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
         num_clients=cfg.num_clients,
         config=fl.server.ServerConfig(num_rounds=cfg.num_rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0},
+        client_resources={"num_cpus": 2, "num_gpus": 0.25},
         ray_init_args={"include_dashboard": False},
     )
 
@@ -1141,7 +1110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--fraction-fit", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument("--data-dir", type=str, default=f"{project_root}/data")
 
     # 新增超参
     parser.add_argument("--selection-top-k", type=int, default=0,
@@ -1152,6 +1121,9 @@ def parse_args() -> argparse.Namespace:
                         help="Jain 公平性滑动窗口大小")
     parser.add_argument("--fedprox-mu", type=float, default=0.0,
                         help="FedProx 近端正则系数，0 则关闭")
+    parser.add_argument("--algorithm", type=str, default="fedavg",
+                        choices=["fedavg", "fedprox", "scaffold"],
+                        help="本地训练算法")
     parser.add_argument("--semi-sync-wait-ratio", type=float, default=0.7,
                         help="半同步等待的发送时间分位数比例")
 
@@ -1174,6 +1146,7 @@ def main() -> None:
         async_agg_interval=args.async_agg_interval,
         fair_window_size=args.fair_window_size,
         fedprox_mu=args.fedprox_mu,
+        algorithm=args.algorithm,
         semi_sync_wait_ratio=args.semi_sync_wait_ratio,
     )
 

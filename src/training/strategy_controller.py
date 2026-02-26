@@ -30,7 +30,7 @@ class StrategyController:
         self.hysteresis_margin = strat.get('hysteresis_margin', 0.05)
         self.bridge_rounds = strat.get('bridge_rounds', 3)
         self.min_rounds_between_switch = strat.get('min_rounds_between_switch', 5)
-        w = strat.get('weights', {})
+        w = strat.get('gate_weights', {})
         # 多指标门控权重
         self.w_per = w.get('per', 0.5)
         self.w_fair = w.get('fairness', 0.3)
