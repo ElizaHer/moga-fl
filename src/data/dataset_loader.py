@@ -1,6 +1,7 @@
 from typing import Tuple, Dict, Any
 import torch
 import numpy as np
+import pandas as pd
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from torchvision.datasets import CIFAR10
@@ -52,6 +53,76 @@ def cifar_loader(cfg: HybridCifarConfig):
     partition_sizes = [len(idx) for idx in partitions]
 
     return trainloaders, testloader, partition_sizes
+
+
+class WSNWirelessSampler:
+    """Provide per-round wireless stats from WSN dataset rows."""
+
+    def __init__(self, per_client_rows: Dict[int, np.ndarray], seed: int = 42):
+        self.per_client_rows = per_client_rows
+        self.rng = np.random.default_rng(seed)
+
+    def sample_round(self) -> Dict[int, Dict[str, float]]:
+        stats: Dict[int, Dict[str, float]] = {}
+        for cid, rows in self.per_client_rows.items():
+            if rows.shape[0] == 0:
+                stats[cid] = {"snr_db": 0.0, "snr_lin": 1.0, "per": 0.5}
+                continue
+            idx = int(self.rng.integers(0, rows.shape[0]))
+            snr_db = float(rows[idx, 0])
+            per = float(np.clip(rows[idx, 1], 0.0, 1.0))
+            stats[cid] = {
+                "snr_db": snr_db,
+                "snr_lin": float(10.0 ** (snr_db / 10.0)),
+                "per": per,
+            }
+        return stats
+
+
+def build_wsn_wireless_sampler(cfg: HybridCifarConfig) -> WSNWirelessSampler:
+    """Load WSN CSV and build client-wise wireless sampler.
+
+    CSV supports either:
+    - direct columns: snr + per
+    - or inferred columns: rssi + noise_floor (+ prr or per)
+    """
+    df = pd.read_csv(cfg.wsn_csv_path)
+    cols = {c.lower(): c for c in df.columns}
+
+    def _pick(name: str) -> str | None:
+        return cols.get(name.lower())
+
+    snr_col = _pick(cfg.wsn_snr_col)
+    if snr_col is None:
+        rssi_col = _pick(cfg.wsn_rssi_col)
+        noise_col = _pick(cfg.wsn_noise_col)
+        if rssi_col is None or noise_col is None:
+            raise ValueError(
+                f"WSN CSV must contain either '{cfg.wsn_snr_col}' or "
+                f"('{cfg.wsn_rssi_col}','{cfg.wsn_noise_col}')"
+            )
+        df["_snr_db"] = pd.to_numeric(df[rssi_col], errors="coerce") - pd.to_numeric(df[noise_col], errors="coerce")
+        snr_col = "_snr_db"
+
+    per_col = _pick(cfg.wsn_per_col)
+    if per_col is None:
+        prr_col = _pick(cfg.wsn_prr_col)
+        if prr_col is None:
+            raise ValueError(
+                f"WSN CSV must contain either '{cfg.wsn_per_col}' or '{cfg.wsn_prr_col}'"
+            )
+        df["_per"] = 1.0 - pd.to_numeric(df[prr_col], errors="coerce")
+        per_col = "_per"
+
+    arr = df[[snr_col, per_col]].apply(pd.to_numeric, errors="coerce").dropna().to_numpy(dtype=np.float64)
+    if arr.shape[0] == 0:
+        raise ValueError("WSN CSV produced empty valid rows for snr/per")
+
+    rng = np.random.default_rng(cfg.seed)
+    rng.shuffle(arr)
+    splits = np.array_split(arr, cfg.num_clients)
+    per_client_rows = {cid: splits[cid] for cid in range(cfg.num_clients)}
+    return WSNWirelessSampler(per_client_rows=per_client_rows, seed=cfg.seed)
 
 
 class DatasetManager:

@@ -32,6 +32,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             cfg: HybridCifarConfig,
             partition_sizes: List[int],
             testloader: DataLoader,
+            wsn_wireless_sampler=None,
     ) -> None:
         self.cfg = cfg
         self.partition_sizes = partition_sizes
@@ -53,6 +54,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.channel = ChannelSimulator(wireless_cfg, cfg.num_clients)
         self.bw = BandwidthAllocator(wireless_cfg)
         self.energy = EnergyEstimator(wireless_cfg)
+        self.wsn_wireless_sampler = wsn_wireless_sampler
 
         base_budget = getattr(self.bw, "budget_mb", None)
         self._base_bandwidth_budget: Optional[float] = float(base_budget) if base_budget is not None else None
@@ -283,7 +285,12 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.last_topk = top_k
 
         # 4) 信道抽样 + 带宽预算更新
-        self.current_wireless_stats = self.channel.sample_round()
+        if self.cfg.wireless_model.lower() == "wsn":
+            if self.wsn_wireless_sampler is None:
+                raise ValueError("wireless_model='wsn' but no WSN wireless sampler provided")
+            self.current_wireless_stats = self.wsn_wireless_sampler.sample_round()
+        else:
+            self.current_wireless_stats = self.channel.sample_round()
         self._update_bandwidth_budget()
 
         # 5) 预估各客户端的数据量/能耗
@@ -389,7 +396,14 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
 
         print(f"selected cids: {scheduled_cids}")
 
-        wireless_stats = self.current_wireless_stats or self.channel.sample_round()
+        if self.current_wireless_stats is not None:
+            wireless_stats = self.current_wireless_stats
+        elif self.cfg.wireless_model.lower() == "wsn":
+            if self.wsn_wireless_sampler is None:
+                raise ValueError("wireless_model='wsn' but no WSN wireless sampler provided")
+            wireless_stats = self.wsn_wireless_sampler.sample_round()
+        else:
+            wireless_stats = self.channel.sample_round()
 
         # 当前轮的 avg_per
         per_values: List[float] = []
@@ -568,4 +582,3 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         set_parameters(self.model_for_eval, parameters_to_ndarrays(parameters))
         loss, acc = evaluate_model(self.model_for_eval, self.testloader, self.device)
         return float(loss), {"accuracy": float(acc)}
-

@@ -19,6 +19,15 @@ class HybridCifarConfig:
     fraction_fit: float = 0.5
     seed: int = 42
     data_dir: str = f"{project_root}/data"
+    # 无线统计来源：simulated / wsn
+    wireless_model: str = "simulated"
+    # WSN 无线数据集配置（仅用于提供 snr/per，不影响 CIFAR 训练数据）
+    wsn_csv_path: str = f"{project_root}/data/wsn_indfeat.csv"
+    wsn_snr_col: str = "snr"
+    wsn_rssi_col: str = "rssi"
+    wsn_noise_col: str = "noise_floor"
+    wsn_prr_col: str = "prr"
+    wsn_per_col: str = "per"
 
     # 半同步与异步
     semi_sync_wait_ratio: float = 0.7

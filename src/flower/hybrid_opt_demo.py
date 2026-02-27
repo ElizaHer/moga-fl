@@ -5,7 +5,7 @@ from flwr.common import Context
 from flwr.server.client_manager import ClientManager
 
 from src.configs.hybrid_cifar import HybridCifarConfig
-from src.data.dataset_loader import cifar_loader
+from src.data.dataset_loader import cifar_loader, build_wsn_wireless_sampler
 from src.training.client import CifarClient
 from src.training.strategy.hybrid_wireless import HybridWirelessStrategy
 from src.utils.train import *
@@ -13,12 +13,15 @@ from src.utils.train import *
 
 def run_hybrid_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
     (train_loaders, test_loader, partition_sizes) = cifar_loader(cfg)
+    wsn_sampler = None
+    if cfg.wireless_model.lower() == "wsn":
+        wsn_sampler = build_wsn_wireless_sampler(cfg)
 
     def client_fn(context: Context) -> fl.client.Client:
         cid = int(context.node_config.get("partition-id", context.node_id))
         return CifarClient(cid, train_loaders[cid], test_loader, cfg.local_epochs, cfg.lr).to_client()
 
-    strategy = HybridWirelessStrategy(cfg, partition_sizes, test_loader)
+    strategy = HybridWirelessStrategy(cfg, partition_sizes, test_loader, wsn_wireless_sampler=wsn_sampler)
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
@@ -67,6 +70,20 @@ def parse_args() -> argparse.Namespace:
                         help="本地训练算法")
     parser.add_argument("--semi-sync-wait-ratio", type=float, default=0.7,
                         help="半同步等待的发送时间分位数比例")
+    parser.add_argument("--wireless-model", type=str, default="simulated", choices=["simulated", "wsn"],
+                        help="无线信道来源：模拟信道或 WSN 数据集信道")
+    parser.add_argument("--wsn-csv-path", type=str, default="",
+                        help="WSN CSV 路径（wireless-model=wsn 时必填）")
+    parser.add_argument("--wsn-snr-col", type=str, default="snr",
+                        help="WSN CSV 中 SNR 列名")
+    parser.add_argument("--wsn-rssi-col", type=str, default="rssi",
+                        help="WSN CSV 中 RSSI 列名（无 snr 列时用于推导）")
+    parser.add_argument("--wsn-noise-col", type=str, default="noise_floor",
+                        help="WSN CSV 中噪声底列名（无 snr 列时用于推导）")
+    parser.add_argument("--wsn-prr-col", type=str, default="prr",
+                        help="WSN CSV 中 PRR 列名（无 per 列时用于推导）")
+    parser.add_argument("--wsn-per-col", type=str, default="per",
+                        help="WSN CSV 中 PER 列名")
     parser.add_argument("--initial-client-energy", type=float, default=100.0,
                         help="每个客户端初始能量（默认所有客户端相同）")
     parser.add_argument(
@@ -94,6 +111,7 @@ def main() -> None:
         custom_energies = [
             float(x.strip()) for x in args.client_initial_energies.split(",") if x.strip()
         ]
+    wsn_csv_path = args.wsn_csv_path if args.wsn_csv_path.strip() else HybridCifarConfig().wsn_csv_path
     cfg = HybridCifarConfig(
         num_clients=args.num_clients,
         num_rounds=args.num_rounds,
@@ -110,6 +128,13 @@ def main() -> None:
         fedprox_mu=args.fedprox_mu,
         algorithm=args.algorithm,
         semi_sync_wait_ratio=args.semi_sync_wait_ratio,
+        wireless_model=args.wireless_model,
+        wsn_csv_path=wsn_csv_path,
+        wsn_snr_col=args.wsn_snr_col,
+        wsn_rssi_col=args.wsn_rssi_col,
+        wsn_noise_col=args.wsn_noise_col,
+        wsn_prr_col=args.wsn_prr_col,
+        wsn_per_col=args.wsn_per_col,
         initial_client_energy=args.initial_client_energy,
         client_initial_energies=custom_energies,
     )

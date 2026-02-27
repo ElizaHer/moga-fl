@@ -66,6 +66,27 @@ python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml --gene
 ```
 完成后会在 outputs/results/ 下生成 pareto_candidates.csv 与偏好部署示例。
 
+## 训练命令
+
+### 使用 WSN 无线数据集
+python .\src\flower\hybrid_opt_demo.py `
+  --wireless-model wsn `
+  --wsn-csv-path ".\data\wsn-indfeat-dataset\combined_wsn.csv" `
+  --wsn-snr-col snr `
+  --wsn-per-col per
+
+### FedAvg
+
+python .\src\flower\hybrid_opt_demo.py --algorithm fedavg
+
+### FedProx
+
+python .\src\flower\hybrid_opt_demo.py --algorithm fedprox --fedprox-mu 0.01
+
+### SCAFFOLD
+
+python .\src\flower\hybrid_opt_demo.py --algorithm scaffold
+
 ## 可视化仪表盘
 - 本项目提供一个无需打包工具的静态可视化页面，位于 `dashboards/` 目录。
 - 页面聚合展示：
