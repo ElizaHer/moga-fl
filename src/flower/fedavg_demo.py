@@ -1,180 +1,21 @@
-from __future__ import annotations
-
-import argparse
-from typing import Dict, List, Tuple
-
 import flwr as fl
-import numpy as np
-import torch
 from flwr.common import Context
-from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
-from torch.utils.data import DataLoader, Subset
-from torchvision.datasets import CIFAR10
-from torchvision.transforms import Compose, Normalize, RandomCrop, RandomHorizontalFlip, ToTensor
 
-from src.flower.hybrid_opt_demo import (
-    CifarClient,
-    HybridCifarConfig,
-    HybridWirelessStrategy,
-    _jain_index,
-    _unpack_tensor_dict,
-    dirichlet_partition_indices,
-    evaluate_model,
-    set_parameters,
-)
-
-
-class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
-    """Keep scheduling/wireless/mode control unchanged, but always aggregate with FedAvg."""
-
-    def aggregate_fit(self, server_round: int, results, failures):  # type: ignore[override]
-        del failures
-        if self.global_params_cache is None:
-            return None, {}
-
-        global_ndarrays = parameters_to_ndarrays(self.global_params_cache)
-        scheduled_cids = list(self.last_selected_cids)
-        if not scheduled_cids:
-            scheduled_cids = [int(res.metrics.get("cid", -1)) for _, res in results]
-            scheduled_cids = [cid for cid in scheduled_cids if 0 <= cid < self.cfg.num_clients]
-
-        wireless_stats = self.current_wireless_stats or self.channel.sample_round()
-        per_values = [
-            float((wireless_stats.get(cid) or {}).get("per", 0.0))
-            for cid in scheduled_cids
-        ]
-        avg_per = float(np.mean(per_values)) if per_values else 0.0
-
-        self._update_bandwidth_budget()
-        bw_map = self.bw.allocate_uniform(scheduled_cids)
-        tx_times: Dict[int, float] = {
-            cid: self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map.get(cid, 0.0)))
-            for cid in scheduled_cids
-        }
-        threshold = float("inf")
-        if scheduled_cids and self.current_mode in ("semi_sync", "bridge"):
-            threshold = float(
-                np.quantile(
-                    np.asarray([tx_times[cid] for cid in scheduled_cids], dtype=np.float64),
-                    self.cfg.semi_sync_wait_ratio,
-                )
-            )
-
-        valid_updates: List[Tuple[List[np.ndarray], float]] = []
-        scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
-        scaffold_weights: Dict[int, float] = {}
-        round_energy = 0.0
-
-        for _, fit_res in results:
-            cid = int(fit_res.metrics.get("cid", -1))
-            if cid < 0 or cid >= self.cfg.num_clients:
-                continue
-            num_examples = int(fit_res.num_examples)
-            if num_examples <= 0:
-                continue
-
-            tx_time = tx_times.get(
-                cid,
-                self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map.get(cid, 0.0))),
-            )
-            per = float((wireless_stats.get(cid, {})).get("per", 0.0))
-            round_energy += self.energy.comm_energy(tx_time) + self.energy.compute_energy(num_examples)
-
-            if np.random.rand() < per:
-                continue
-            if self.current_mode in ("semi_sync", "bridge") and tx_time > threshold:
-                continue
-
-            ndarrays = parameters_to_ndarrays(fit_res.parameters)
-            weight = float(num_examples)
-            valid_updates.append((ndarrays, weight))
-
-            if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
-                payload = fit_res.metrics.get("delta_ci", b"")
-                if isinstance(payload, (bytes, bytearray)) and len(payload) > 0:
-                    delta_ci = _unpack_tensor_dict(bytes(payload), torch.device("cpu"))
-                    if delta_ci:
-                        scaffold_deltas[cid] = delta_ci
-                        scaffold_weights[cid] = weight
-
-        merged = self._weighted_avg(valid_updates, global_ndarrays) if valid_updates else global_ndarrays
-        self.global_params_cache = ndarrays_to_parameters(merged)
-
-        if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None and scaffold_deltas:
-            self.scaffold_state.update_global(scaffold_deltas, scaffold_weights)
-
-        set_parameters(self.model_for_eval, merged)
-        loss, acc = evaluate_model(self.model_for_eval, self.testloader, self.device)
-        self.acc_history.append(float(acc))
-        self.energy_history.append(float(round_energy))
-
-        counts = self._compute_selection_counts()
-        jain = _jain_index(counts)
-        self.avg_per_history.append(avg_per)
-        self.jain_history.append(jain)
-        self.controller.register(avg_per=avg_per, jain=jain, total_energy=round_energy)
-
-        self._log_metrics(
-            server_round=server_round,
-            mode=self.current_mode,
-            accuracy=float(acc),
-            loss=float(loss),
-            avg_per=avg_per,
-            jain=jain,
-            energy=float(round_energy),
-            bw_factor=float(self.current_bw_factor),
-            topk=len(scheduled_cids),
-        )
-        return self.global_params_cache, {
-            "accuracy": float(acc),
-            "loss": float(loss),
-            "avg_per": float(avg_per),
-            "jain": float(jain),
-            "mode": self.current_mode,
-            "energy": float(round_energy),
-            "bw_factor": float(self.current_bw_factor),
-            "topk": float(len(scheduled_cids)),
-        }
+from src.configs.hybrid_cifar import HybridCifarConfig
+from src.data.dataset_loader import cifar_loader
+from src.training.client import CifarClient
+from src.training.strategy.fedavg_only import FedAvgOnlyHybridStrategy
+from src.utils.train import *
 
 
 def run_fedavg_only_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-
-    train_transform = Compose(
-        [
-            RandomCrop(32, padding=4),
-            RandomHorizontalFlip(),
-            ToTensor(),
-            Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        ]
-    )
-    test_transform = Compose([ToTensor(), Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
-
-    trainset = CIFAR10(root=cfg.data_dir, train=True, download=True, transform=train_transform)
-    raw_trainset = CIFAR10(root=cfg.data_dir, train=True, download=False, transform=ToTensor())
-    testset = CIFAR10(root=cfg.data_dir, train=False, download=True, transform=test_transform)
-    labels = np.array(raw_trainset.targets)
-    partitions = dirichlet_partition_indices(labels, cfg.num_clients, cfg.alpha, cfg.seed)
-    partition_sizes = [len(idx) for idx in partitions]
-
-    trainloaders = [
-        DataLoader(
-            Subset(trainset, indices),
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            drop_last=False,
-            num_workers=0,
-        )
-        for indices in partitions
-    ]
-    testloader = DataLoader(testset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+    (train_loaders, test_loader, partition_sizes) = cifar_loader(cfg)
 
     def client_fn(context: Context) -> fl.client.Client:
         cid = int(context.node_config.get("partition-id", context.node_id))
-        return CifarClient(cid, trainloaders[cid], testloader, cfg.local_epochs, cfg.lr).to_client()
+        return CifarClient(cid, train_loaders[cid], test_loader, cfg.local_epochs, cfg.lr).to_client()
 
-    strategy = FedAvgOnlyHybridStrategy(cfg, partition_sizes, testloader)
+    strategy = FedAvgOnlyHybridStrategy(cfg, partition_sizes, test_loader)
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=cfg.num_clients,

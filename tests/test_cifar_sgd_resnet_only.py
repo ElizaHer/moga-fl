@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import ToTensor, Normalize, Compose, transforms
-from src.training.models.resnet_cifar import build_resnet18_cifar
+from src.training.models.resnet import build_resnet18
 
 
 def load_cifar10_data():
@@ -124,7 +124,7 @@ def main():
 
     # 初始化全局模型
     print("初始化ResNet-18模型...")
-    model = build_resnet18_cifar(num_classes=10, width_factor=1.0, dropout_rate=0.5).to(device)
+    model = build_resnet18(num_classes=10, width_factor=1.0, dropout_rate=0.5).to(device)
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     client = SimpleClient(model, train_dataset, partitions, device, test_loader)
 

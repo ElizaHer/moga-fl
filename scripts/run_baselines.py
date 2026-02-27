@@ -8,7 +8,7 @@ from src.data.dataset_loader import DatasetManager
 from src.data.partition import dirichlet_partition, label_bias_partition, quantity_bias_partition, apply_quick_limit
 from src.training.models.cifar_cnn import SimpleCIFARCNN
 from src.training.models.emnist_cnn import SimpleEMNISTCNN
-from src.training.models.resnet_cifar import build_resnet18_cifar
+from src.training.models.resnet import build_resnet18
 from src.training.models.resnet_emnist import build_resnet18_emnist
 from src.training.server import Server
 from src.eval.metrics import MetricsRecorder
@@ -46,7 +46,7 @@ def build_model_fn(cfg, num_classes):
     dataset_name = cfg['dataset']['name']
 
     if mtype == 'resnet18_cifar' and dataset_name == 'cifar10':
-        return lambda: build_resnet18_cifar(num_classes=num_classes, width_factor=width_factor)
+        return lambda: build_resnet18(num_classes=num_classes, width_factor=width_factor)
     if mtype == 'resnet18_emnist' and dataset_name == 'emnist':
         # EMNIST Balanced 有 47 类，其它 split 可通过 num_classes 传入
         return lambda: build_resnet18_emnist(num_classes=num_classes, width_factor=width_factor)

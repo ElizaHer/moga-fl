@@ -1,8 +1,57 @@
-import os
 from typing import Tuple, Dict, Any
 import torch
+import numpy as np
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
+from torchvision.datasets import CIFAR10
+from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor, Normalize
+from torch.utils.data import DataLoader, Subset
+
+from src.configs.hybrid_cifar import HybridCifarConfig
+from src.data.partition import dirichlet_partition_indices
+
+
+def cifar_loader(cfg: HybridCifarConfig):
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    train_transform = Compose(
+        [
+            RandomCrop(32, padding=4),
+            RandomHorizontalFlip(),
+            ToTensor(),
+            Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+    test_transform = Compose(
+        [
+            ToTensor(),
+            Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+
+    trainset = CIFAR10(root=cfg.data_dir, train=True, download=True, transform=train_transform)
+    raw_trainset = CIFAR10(root=cfg.data_dir, train=True, download=False, transform=ToTensor())
+    testset = CIFAR10(root=cfg.data_dir, train=False, download=True, transform=test_transform)
+
+    labels = np.array(raw_trainset.targets)
+    partitions = dirichlet_partition_indices(labels, cfg.num_clients, cfg.alpha, cfg.seed)
+
+    trainloaders = [
+        DataLoader(
+            Subset(trainset, indices),
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            drop_last=False,
+            num_workers=0,
+        )
+        for indices in partitions
+    ]
+    testloader = DataLoader(testset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+
+    partition_sizes = [len(idx) for idx in partitions]
+
+    return trainloaders, testloader, partition_sizes
 
 
 class DatasetManager:

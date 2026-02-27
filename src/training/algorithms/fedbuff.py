@@ -1,54 +1,88 @@
-from typing import Dict, Any, List
+from typing import Any, Deque, Dict, List, Tuple
+from collections import deque
 import copy
+import numpy as np
 
-class FedBuffBuffer:
-    def __init__(self, buffer_size: int, staleness_alpha: float, max_staleness: int | None = None):
-        """简化版 FedBuff 缓冲队列。
 
-        - buffer_size: 最大缓冲更新条数；
-        - staleness_alpha: 陈旧度衰减指数；
-        - max_staleness: 若不为 None，则超过该陈旧度的更新会被丢弃。
-
-        对应问题3：高丢包场景下的异步聚合（FedBuff 风格）。
-        """
-        self.buffer_size = buffer_size
-        self.alpha = staleness_alpha
+class FedBuffState:
+    def __init__(
+        self,
+        alpha: float,
+        max_staleness: int,
+        buffer_size: int,
+        min_updates: int,
+        async_agg_interval: int,
+    ) -> None:
+        self.alpha = alpha
         self.max_staleness = max_staleness
-        self.entries = []  # list of (state_dict, staleness)
+        self.buffer_size = buffer_size
+        self.min_updates = min_updates
+        self.async_agg_interval = async_agg_interval
 
-    def push(self, state_dict: Dict[str, Any], staleness: int):
-        self.entries.append((copy.deepcopy(state_dict), int(staleness)))
-        if len(self.entries) > self.buffer_size:
-            # 丢弃最旧的一条
-            self.entries.pop(0)
+        # entries: (params, staleness, num_examples)
+        self.entries: Deque[Tuple[List[np.ndarray], int, int]] = deque()
+        self.updates_since_last_agg = 0
+        self.last_agg_round = 0
+        self.last_age_round = 0
 
-    def age_entries(self, delta: int = 1):
-        """让缓冲中的条目整体“变旧”，用于跨轮累积陈旧度。"""
-        if delta <= 0 or not self.entries:
+    def age(self, current_round: int) -> None:
+        """按轮次差值 old->new 进行 aging，避免重复过度老化。"""
+        if current_round <= self.last_age_round:
             return
-        new_entries = []
-        for sd, stale in self.entries:
-            new_stale = stale + delta
-            if self.max_staleness is not None and new_stale > self.max_staleness:
-                # 超过最大陈旧度则直接丢弃
-                continue
-            new_entries.append((sd, new_stale))
-        self.entries = new_entries
+        delta = current_round - self.last_age_round
+        if delta <= 0:
+            return
+        aged: Deque[Tuple[List[np.ndarray], int, int]] = deque()
+        for params, staleness, num_examples in self.entries:
+            s = staleness + delta
+            if s <= self.max_staleness:
+                aged.append((params, s, num_examples))
+        self.entries = aged
+        self.last_age_round = current_round
 
-    def aggregate(self, global_state: Dict[str, Any]):
+    def push(self, params: List[np.ndarray], num_examples: int) -> None:
+        self.entries.append((params, 0, num_examples))
+        self.updates_since_last_agg += 1
+
+    def should_aggregate(self, server_round: int) -> bool:
+        if len(self.entries) >= self.buffer_size:
+            return True
+        if self.updates_since_last_agg >= self.min_updates:
+            return True
+        if (
+            self.async_agg_interval > 0
+            and server_round - self.last_agg_round >= self.async_agg_interval
+            and len(self.entries) > 0
+        ):
+            return True
+        return False
+
+    def aggregate(self, fallback_params: List[np.ndarray], server_round: int) -> List[np.ndarray]:
         if not self.entries:
-            return global_state
-        total_w = 0.0
-        out = copy.deepcopy(global_state)
-        for k in out.keys():
-            out[k] = 0.0
-        for sd, stale in self.entries:
-            w = 1.0 / (1.0 + stale) ** self.alpha
-            total_w += w
-            for k in out.keys():
-                out[k] += w * sd[k]
-        for k in out.keys():
-            out[k] = out[k] / max(1e-9, total_w)
-        # 清空缓冲，等待下一批异步更新
+            return fallback_params
+
+        sum_weights = 0.0
+        agg = [arr.copy() for arr in fallback_params]
+        for i in range(len(agg)):
+            if np.issubdtype(agg[i].dtype, np.floating):
+                agg[i] = np.zeros_like(agg[i], dtype=np.float32)
+
+        for params, staleness, num_examples in self.entries:
+            staleness_weight = 1.0 / ((1.0 + float(staleness)) ** self.alpha)
+            w = staleness_weight * float(num_examples)
+            sum_weights += w
+            for idx, arr in enumerate(params):
+                if np.issubdtype(agg[idx].dtype, np.floating):
+                    agg[idx] += w * arr.astype(np.float32, copy=False)
+
+        out: List[np.ndarray] = []
+        for arr in agg:
+            if np.issubdtype(arr.dtype, np.floating):
+                out.append(arr / max(sum_weights, 1e-12))
+            else:
+                out.append(arr)
+
         self.entries.clear()
+        self.updates_since_last_agg = 0
+        self.last_agg_round = server_round
         return out

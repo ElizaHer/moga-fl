@@ -10,7 +10,7 @@ from flwr.common import Context, NDArrays, Scalar
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, RandomCrop, RandomHorizontalFlip, ToTensor
-from src.training.models.resnet_cifar import build_resnet18_cifar
+from src.training.models.resnet import build_resnet18
 
 
 def get_parameters(model: nn.Module) -> NDArrays:
@@ -75,7 +75,7 @@ class CifarClient(fl.client.NumPyClient):
         lr: float,
     ) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_resnet18_cifar().to(self.device)
+        self.model = build_resnet18().to(self.device)
         self.trainloader = trainloader
         self.valloader = valloader
         self.local_epochs = local_epochs
@@ -116,7 +116,7 @@ class CifarClient(fl.client.NumPyClient):
 
 
 def get_server_evaluate_fn(testloader: DataLoader):
-    model = build_resnet18_cifar()
+    model = build_resnet18()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 

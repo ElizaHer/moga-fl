@@ -14,23 +14,22 @@ class ChannelSimulator:
       的半同步/异步聚合与门控切换。"""
 
     def __init__(self, cfg: Dict[str, Any], num_clients: int):
-        wcfg = cfg.get('wireless', {})
-        model_name = wcfg.get('channel_model', 'rayleigh_siso')
-        params = get_channel_model_params(model_name, wcfg)
+        model_name = cfg.get('channel_model', 'rayleigh_siso')
+        params = get_channel_model_params(model_name, cfg)
         # 兼容旧配置：若用户在 YAML 中直接写了数值，则在近似模型基础上做覆盖
-        self.intensity = wcfg.get('block_fading_intensity', params['block_fading_intensity'])
-        self.base_snr_db = wcfg.get('base_snr_db', params['base_snr_db'])
-        self.per_k = wcfg.get('per_k', params['per_k'])
-        self.d_min = float(wcfg.get('d_min_m', params.get('d_min_m', 10.0)))
-        self.d_max = float(wcfg.get('d_max_m', params.get('d_max_m', 250.0)))
-        self.shadowing_sigma_db = float(wcfg.get('shadowing_sigma_db', params.get('shadowing_sigma_db', 4.0)))
-        self.carrier_ghz = float(wcfg.get('carrier_ghz', 3.5))
+        self.intensity = cfg.get('block_fading_intensity', params['block_fading_intensity'])
+        self.base_snr_db = cfg.get('base_snr_db', params['base_snr_db'])
+        self.per_k = cfg.get('per_k', params['per_k'])
+        self.d_min = float(cfg.get('d_min_m', params.get('d_min_m', 10.0)))
+        self.d_max = float(cfg.get('d_max_m', params.get('d_max_m', 250.0)))
+        self.shadowing_sigma_db = float(cfg.get('shadowing_sigma_db', params.get('shadowing_sigma_db', 4.0)))
+        self.carrier_ghz = float(cfg.get('carrier_ghz', 3.5))
 
         self.num_clients = num_clients
 
         # 简单的“用户位置/距离”建模：每个客户端一个随机距离，并可随轮缓慢移动
         self.distances = np.random.uniform(self.d_min, self.d_max, size=self.num_clients)
-        mob = wcfg.get('mobility', {})
+        mob = cfg.get('mobility', {})
         self.mobility_enabled = bool(mob.get('enabled', False))
         self.max_step_m = float(mob.get('max_step_m_per_round', 5.0))
 

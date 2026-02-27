@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, Normalize, RandomCrop, RandomHorizontalFlip, ToTensor
 
-from src.training.models.resnet_cifar import build_resnet18_cifar
+from src.training.models.resnet import build_resnet18
 from src.wireless.bandwidth import BandwidthAllocator
 from src.wireless.channel import ChannelSimulator
 from src.wireless.energy import EnergyEstimator
@@ -262,7 +262,7 @@ class CifarClient(fl.client.NumPyClient):
     def __init__(self, cid: int, trainloader: DataLoader, testloader: DataLoader, local_epochs: int, lr: float) -> None:
         self.cid = cid
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_resnet18_cifar().to(self.device)
+        self.model = build_resnet18().to(self.device)
         self.trainloader = trainloader
         self.testloader = testloader
         self.local_epochs = local_epochs
@@ -298,7 +298,7 @@ class HybridWirelessStrategy(Strategy):
         self.cfg = cfg
         self.testloader = testloader
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_for_eval = build_resnet18_cifar().to(self.device)
+        self.model_for_eval = build_resnet18().to(self.device)
         self.controller = ModeController(cfg, cfg.num_clients)
         self.fedbuff = FedBuffState(
             alpha=cfg.staleness_alpha,
@@ -320,7 +320,7 @@ class HybridWirelessStrategy(Strategy):
 
     def initialize_parameters(self, client_manager: ClientManager) -> Parameters:
         del client_manager
-        ndarrays = get_parameters(build_resnet18_cifar())
+        ndarrays = get_parameters(build_resnet18())
         self.global_params_cache = ndarrays_to_parameters(ndarrays)
         return self.global_params_cache
 

@@ -4,6 +4,25 @@ from collections import defaultdict
 from fedlab.utils.dataset import CIFAR10Partitioner, MNISTPartitioner
 
 
+def dirichlet_partition_indices(
+    labels: np.ndarray, num_clients: int, alpha: float, seed: int
+) -> List[List[int]]:
+    rng = np.random.default_rng(seed)
+    client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+    num_classes = int(labels.max()) + 1
+    for c in range(num_classes):
+        class_ids = np.where(labels == c)[0]
+        rng.shuffle(class_ids)
+        proportions = rng.dirichlet([alpha] * num_clients)
+        split_points = (np.cumsum(proportions) * len(class_ids)).astype(int)[:-1]
+        splits = np.split(class_ids, split_points)
+        for cid, idx in enumerate(splits):
+            client_indices[cid].extend(idx.tolist())
+    for cid in range(num_clients):
+        rng.shuffle(client_indices[cid])
+    return client_indices
+
+
 def iid_partition_indices(
     num_samples: int, num_clients: int, seed: int
 ) -> List[List[int]]:
