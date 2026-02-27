@@ -1,0 +1,80 @@
+strategy_name: hybrid_opt
+
+dataset:
+  name: cifar10
+  data_dir: ./data
+  alpha: 0.5
+  batch_size: 128
+
+fl:
+  num_clients: 10
+  num_rounds: 8
+  local_epochs: 1
+  lr: 0.001
+  fraction_fit: 0.5
+  seed: 42
+  client_resources:
+    num_cpus: 2
+    num_gpus: 0.25
+
+wireless:
+  wireless_model: simulated  # simulated / wsn
+  simulated_mode: good       # good / bad / jitter
+  jitter_period_rounds: 20
+  jitter_start_state: good
+  wsn_csv_path: ./data/wsn-indfeat-dataset/combined_wsn.csv
+  wsn_snr_col: snr
+  wsn_rssi_col: rssi
+  wsn_noise_col: noise_floor
+  wsn_prr_col: prr
+  wsn_per_col: per
+  channel_model: tr38901_umi
+  block_fading_intensity: 1.0
+  base_snr_db: 8.0
+  per_k: 1.0
+  bandwidth_budget_mb_per_round: 12.0
+  tx_power_watts: 1.0
+  compute_power_watts: 8.0
+  compute_rate_samples_per_sec: 2000
+
+algorithm:
+  name: fedavg
+  fedprox_mu: 0.0
+
+energy:
+  initial_client_energy: 100.0
+  client_initial_energies:
+
+scheduler:
+  selection_top_k: 0
+  fair_window_size: 4
+  weights:
+    channel_w: 0.25
+    data_w: 0.25
+    fair_w: 0.25
+    energy_w: 0.15
+
+controller:
+  mode_policy: hybrid
+  semi_sync_wait_ratio: 0.7
+  window_size: 4
+  gate_thresholds:
+    to_async: 0.58
+    to_semi_sync: 0.42
+  hysteresis_margin: 0.03
+  bridge_rounds: 2
+  min_rounds_between_switch: 2
+  gate_weights:
+    per: 0.5
+    fairness: 0.3
+    energy: 0.2
+  bandwidth_rebalance:
+    low_energy_factor: 0.8
+    high_energy_factor: 1.0
+
+fedbuff:
+  buffer_size: 16
+  min_updates_to_aggregate: 8
+  staleness_alpha: 1.0
+  max_staleness: 8
+  async_agg_interval: 2

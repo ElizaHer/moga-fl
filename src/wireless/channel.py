@@ -24,6 +24,10 @@ class ChannelSimulator:
         self.d_max = float(cfg.get('d_max_m', params.get('d_max_m', 250.0)))
         self.shadowing_sigma_db = float(cfg.get('shadowing_sigma_db', params.get('shadowing_sigma_db', 4.0)))
         self.carrier_ghz = float(cfg.get('carrier_ghz', 3.5))
+        self.simulated_mode = str(cfg.get("simulated_mode", "good")).lower()  # good / bad / jitter
+        self.jitter_period_rounds = int(cfg.get("jitter_period_rounds", 20))
+        self.jitter_start_state = str(cfg.get("jitter_start_state", "good")).lower()
+        self.round_idx = 0
 
         self.num_clients = num_clients
 
@@ -32,6 +36,23 @@ class ChannelSimulator:
         mob = cfg.get('mobility', {})
         self.mobility_enabled = bool(mob.get('enabled', False))
         self.max_step_m = float(mob.get('max_step_m_per_round', 5.0))
+
+    def _mode_for_round(self) -> str:
+        if self.simulated_mode != "jitter":
+            return self.simulated_mode
+        period = max(1, int(self.jitter_period_rounds))
+        phase = (self.round_idx // period) % 2
+        if self.jitter_start_state == "bad":
+            return "bad" if phase == 0 else "good"
+        return "good" if phase == 0 else "bad"
+
+    @staticmethod
+    def _apply_mode_per(per: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "bad":
+            # Keep PER generally high and mostly >0.5
+            return np.clip(0.55 + 0.45 * per, 0.55, 1.0)
+        # good/default: keep PER low
+        return np.clip(0.20 * per, 0.0, 0.20)
 
     def _update_positions(self):
         if not self.mobility_enabled:
@@ -73,7 +94,9 @@ class ChannelSimulator:
         snr_lin = 10 ** (snr_db / 10.0)
 
         # 5) Map SNR to packet error rate (PER): per = exp(-k * snr_lin)
-        per = np.exp(-float(self.per_k) * snr_lin)
+        raw_per = np.exp(-float(self.per_k) * snr_lin)
+        mode = self._mode_for_round()
+        per = self._apply_mode_per(raw_per, mode)
         stats: Dict[int, Dict[str, float]] = {}
         for i in range(self.num_clients):
             stats[i] = {
@@ -81,5 +104,7 @@ class ChannelSimulator:
                 'snr_lin': float(snr_lin[i]),
                 'per': float(np.clip(per[i], 0.0, 1.0)),
                 'distance_m': float(d[i]),
+                'sim_mode': mode,
             }
+        self.round_idx += 1
         return stats

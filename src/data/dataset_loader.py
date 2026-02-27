@@ -8,13 +8,30 @@ from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor, Normalize
 from torch.utils.data import DataLoader, Subset
 
-from src.configs.hybrid_cifar import HybridCifarConfig
 from src.data.partition import dirichlet_partition_indices
 
 
-def cifar_loader(cfg: HybridCifarConfig):
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
+def _cfg_get(cfg, *keys, default=None):
+    cur = cfg
+    for key in keys:
+        if isinstance(cur, dict):
+            cur = cur.get(key, None)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return default
+    return cur
+
+
+def cifar_loader(cfg):
+    seed = int(_cfg_get(cfg, "fl", "seed", default=_cfg_get(cfg, "seed", default=42)))
+    data_dir = str(_cfg_get(cfg, "dataset", "data_dir", default=_cfg_get(cfg, "data_dir", default="./data")))
+    num_clients = int(_cfg_get(cfg, "fl", "num_clients", default=_cfg_get(cfg, "num_clients", default=10)))
+    alpha = float(_cfg_get(cfg, "dataset", "alpha", default=_cfg_get(cfg, "alpha", default=0.5)))
+    batch_size = int(_cfg_get(cfg, "dataset", "batch_size", default=_cfg_get(cfg, "batch_size", default=128)))
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     train_transform = Compose(
         [
@@ -31,24 +48,24 @@ def cifar_loader(cfg: HybridCifarConfig):
         ]
     )
 
-    trainset = CIFAR10(root=cfg.data_dir, train=True, download=True, transform=train_transform)
-    raw_trainset = CIFAR10(root=cfg.data_dir, train=True, download=False, transform=ToTensor())
-    testset = CIFAR10(root=cfg.data_dir, train=False, download=True, transform=test_transform)
+    trainset = CIFAR10(root=data_dir, train=True, download=True, transform=train_transform)
+    raw_trainset = CIFAR10(root=data_dir, train=True, download=False, transform=ToTensor())
+    testset = CIFAR10(root=data_dir, train=False, download=True, transform=test_transform)
 
     labels = np.array(raw_trainset.targets)
-    partitions = dirichlet_partition_indices(labels, cfg.num_clients, cfg.alpha, cfg.seed)
+    partitions = dirichlet_partition_indices(labels, num_clients, alpha, seed)
 
     trainloaders = [
         DataLoader(
             Subset(trainset, indices),
-            batch_size=cfg.batch_size,
+            batch_size=batch_size,
             shuffle=True,
             drop_last=False,
             num_workers=0,
         )
         for indices in partitions
     ]
-    testloader = DataLoader(testset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+    testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     partition_sizes = [len(idx) for idx in partitions]
 
@@ -79,37 +96,46 @@ class WSNWirelessSampler:
         return stats
 
 
-def build_wsn_wireless_sampler(cfg: HybridCifarConfig) -> WSNWirelessSampler:
+def build_wsn_wireless_sampler(cfg) -> WSNWirelessSampler:
     """Load WSN CSV and build client-wise wireless sampler.
 
     CSV supports either:
     - direct columns: snr + per
     - or inferred columns: rssi + noise_floor (+ prr or per)
     """
-    df = pd.read_csv(cfg.wsn_csv_path)
+    wsn_csv_path = str(_cfg_get(cfg, "wireless", "wsn_csv_path", default=_cfg_get(cfg, "wsn_csv_path", default="")))
+    wsn_snr_col = str(_cfg_get(cfg, "wireless", "wsn_snr_col", default=_cfg_get(cfg, "wsn_snr_col", default="snr")))
+    wsn_rssi_col = str(_cfg_get(cfg, "wireless", "wsn_rssi_col", default=_cfg_get(cfg, "wsn_rssi_col", default="rssi")))
+    wsn_noise_col = str(_cfg_get(cfg, "wireless", "wsn_noise_col", default=_cfg_get(cfg, "wsn_noise_col", default="noise_floor")))
+    wsn_prr_col = str(_cfg_get(cfg, "wireless", "wsn_prr_col", default=_cfg_get(cfg, "wsn_prr_col", default="prr")))
+    wsn_per_col = str(_cfg_get(cfg, "wireless", "wsn_per_col", default=_cfg_get(cfg, "wsn_per_col", default="per")))
+    seed = int(_cfg_get(cfg, "fl", "seed", default=_cfg_get(cfg, "seed", default=42)))
+    num_clients = int(_cfg_get(cfg, "fl", "num_clients", default=_cfg_get(cfg, "num_clients", default=10)))
+
+    df = pd.read_csv(wsn_csv_path)
     cols = {c.lower(): c for c in df.columns}
 
     def _pick(name: str) -> str | None:
         return cols.get(name.lower())
 
-    snr_col = _pick(cfg.wsn_snr_col)
+    snr_col = _pick(wsn_snr_col)
     if snr_col is None:
-        rssi_col = _pick(cfg.wsn_rssi_col)
-        noise_col = _pick(cfg.wsn_noise_col)
+        rssi_col = _pick(wsn_rssi_col)
+        noise_col = _pick(wsn_noise_col)
         if rssi_col is None or noise_col is None:
             raise ValueError(
-                f"WSN CSV must contain either '{cfg.wsn_snr_col}' or "
-                f"('{cfg.wsn_rssi_col}','{cfg.wsn_noise_col}')"
+                f"WSN CSV must contain either '{wsn_snr_col}' or "
+                f"('{wsn_rssi_col}','{wsn_noise_col}')"
             )
         df["_snr_db"] = pd.to_numeric(df[rssi_col], errors="coerce") - pd.to_numeric(df[noise_col], errors="coerce")
         snr_col = "_snr_db"
 
-    per_col = _pick(cfg.wsn_per_col)
+    per_col = _pick(wsn_per_col)
     if per_col is None:
-        prr_col = _pick(cfg.wsn_prr_col)
+        prr_col = _pick(wsn_prr_col)
         if prr_col is None:
             raise ValueError(
-                f"WSN CSV must contain either '{cfg.wsn_per_col}' or '{cfg.wsn_prr_col}'"
+                f"WSN CSV must contain either '{wsn_per_col}' or '{wsn_prr_col}'"
             )
         df["_per"] = 1.0 - pd.to_numeric(df[prr_col], errors="coerce")
         per_col = "_per"
@@ -118,11 +144,11 @@ def build_wsn_wireless_sampler(cfg: HybridCifarConfig) -> WSNWirelessSampler:
     if arr.shape[0] == 0:
         raise ValueError("WSN CSV produced empty valid rows for snr/per")
 
-    rng = np.random.default_rng(cfg.seed)
+    rng = np.random.default_rng(seed)
     rng.shuffle(arr)
-    splits = np.array_split(arr, cfg.num_clients)
-    per_client_rows = {cid: splits[cid] for cid in range(cfg.num_clients)}
-    return WSNWirelessSampler(per_client_rows=per_client_rows, seed=cfg.seed)
+    splits = np.array_split(arr, num_clients)
+    per_client_rows = {cid: splits[cid] for cid in range(num_clients)}
+    return WSNWirelessSampler(per_client_rows=per_client_rows, seed=seed)
 
 
 class DatasetManager:

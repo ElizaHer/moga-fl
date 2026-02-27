@@ -87,6 +87,29 @@ python .\src\flower\hybrid_opt_demo.py --algorithm fedprox --fedprox-mu 0.01
 
 python .\src\flower\hybrid_opt_demo.py --algorithm scaffold
 
+### baselines
+
+默认 hybrid（读取 hybrid_opt.yaml）：
+python .\src\flower\hybrid_opt_demo.py --strategy hybrid_opt
+
+• 运行 Sync baseline：
+python .\src\flower\hybrid_opt_demo.py --strategy sync
+
+• 运行 Async baseline：
+python .\src\flower\hybrid_opt_demo.py --strategy async
+
+• 运行 BridgeFree baseline：
+python .\src\flower\hybrid_opt_demo.py --strategy bridge_free
+
+• 运行 BandwidthFirst baseline：
+python .\src\flower\hybrid_opt_demo.py --strategy bandwidth_first
+
+• 运行 EnergyFirst baseline：
+python .\src\flower\hybrid_opt_demo.py --strategy energy_first
+
+• 示例：CLI 覆盖 YAML（优先级更高）：
+python .\src\flower\hybrid_opt_demo.py --strategy hybrid_opt --num-rounds 12
+
 ## 可视化仪表盘
 - 本项目提供一个无需打包工具的静态可视化页面，位于 `dashboards/` 目录。
 - 页面聚合展示：

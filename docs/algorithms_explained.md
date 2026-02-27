@@ -174,6 +174,87 @@
 
 这些都是代码里“调音台式权重混合”和“公平债务 + 预算再平衡”思想的具体落地。
 
+不变量检查方法：
+可以，先把机制定成“可解释 + 可落地 + 可调参”。
+
+**1. 检测什么（每轮 bridge 后评估）**
+
+1. 预算不变量  
+- 能量预算：`E_round <= E_budget_round`  
+- 带宽/时延预算：`T_upload_round <= T_budget_round`（或 `sum(payload_i / bw_i)`）  
+- 预算来源：
+  - 固定阈值（YAML 配）
+  - 或动态阈值（过去 `W` 轮的 P90/P95）
+
+2. 陈旧度不变量  
+- `max(staleness_i) <= max_staleness`  
+- `staleness` 可以用“更新产生轮次 vs 当前聚合轮次”计算  
+- 对 semi-sync/bridge 下的慢客户端，若 `tx_time` 超阈值导致持续滞后，也视为潜在 staleness 风险
+
+3. 公平债务趋势不变量  
+- 定义债务 `debt_i = max(0, target_select_rate - actual_rate_i)`（滑窗）  
+- 期望 bridge 期内“总债务下降”：  
+  - `mean_debt_t <= mean_debt_{t-1}`，或更稳健：`EMA_debt_t` 单调不升  
+- 若债务不上升但高位震荡，也可判“未改善”
+
+---
+
+**2. 三种动作怎么执行**
+
+1. 客户端降权（soft）  
+- 场景：预算超标或 staleness 风险来自少数客户端  
+- 做法：聚合权重乘惩罚因子  
+  - `w_i' = w_i * penalty_i`
+  - `penalty_i` 由风险分数组合：高 `tx_time`、高 `per`、高 staleness、低剩余能量  
+- 优点：不直接剔除，训练更平滑
+
+2. 限流（rate limit）  
+- 场景：总体预算超标（尤其上传时延/带宽）  
+- 做法：
+  - 降低本轮总带宽预算 `bw_budget *= gamma`（`gamma<1`）
+  - 或减少 top-k / 提高 semi-sync 等待分位阈值策略
+- 优先对“高成本低收益”客户端限流（非全体一刀切）
+
+3. 延长 bridge（stability-first）  
+- 场景：连续 `K` 轮不变量失败，说明直接切 async/semi-sync 风险高  
+- 做法：`bridge_rounds += extra_rounds`（有上限）  
+- 触发条件建议“连续失败 + 指标未改善”，避免频繁延长
+
+---
+
+**3. 触发依据建议**
+
+每轮 bridge 计算 violation score：
+- `v_budget = max(0, E_round/E_budget - 1) + max(0, T_round/T_budget - 1)`
+- `v_stale = max(0, stale_max/max_staleness - 1)`
+- `v_fair = max(0, mean_debt_t - mean_debt_{t-1})`
+
+总分：
+- `V = a*v_budget + b*v_stale + c*v_fair`
+
+动作映射：
+- `V < th1`：无动作  
+- `th1 <= V < th2`：客户端降权  
+- `th2 <= V < th3`：降权 + 限流  
+- `V >= th3` 或连续 `K` 轮失败：降权 + 限流 + 延长 bridge
+
+---
+
+**4. 参数放哪里**
+
+在 YAML `controller.bridge_invariants` 下统一配置，例如：
+- `energy_budget_round`
+- `upload_time_budget_round`
+- `fairness_debt_trend: non_increasing`
+- `violation_weights: {budget, stale, fair}`
+- `thresholds: {th1, th2, th3}`
+- `rate_limit_factor`
+- `bridge_extend_rounds`
+- `max_bridge_rounds`
+- `fail_streak_for_extend`
+
+---
+
 ---
 
 ## 5. FedProx 与 SCAFFOLD：如何在 non‑IID 场景中稳住训练？

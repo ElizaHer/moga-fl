@@ -1,148 +1,104 @@
 from __future__ import annotations
 
+import argparse
+import logging
+from typing import Dict
+
 import flwr as fl
+import numpy as np
 from flwr.common import Context
-from flwr.server.client_manager import ClientManager
 
-from src.configs.hybrid_cifar import HybridCifarConfig
-from src.data.dataset_loader import cifar_loader, build_wsn_wireless_sampler
+from src.configs.strategy_runtime import apply_cli_overrides, default_strategy_yaml, load_strategy_yaml
+from src.data.dataset_loader import build_wsn_wireless_sampler, cifar_loader
 from src.training.client import CifarClient
-from src.training.strategy.hybrid_wireless import HybridWirelessStrategy
-from src.utils.train import *
+from src.training.strategy.factory import build_strategy
 
 
-def run_hybrid_flower_cifar(cfg: HybridCifarConfig) -> Dict[str, object]:
-    (train_loaders, test_loader, partition_sizes) = cifar_loader(cfg)
-    wsn_sampler = None
-    if cfg.wireless_model.lower() == "wsn":
-        wsn_sampler = build_wsn_wireless_sampler(cfg)
+def run_hybrid_flower_cifar(cfg: Dict, strategy_name: str) -> Dict[str, object]:
+    train_loaders, test_loader, partition_sizes = cifar_loader(cfg)
+    wireless_model = str(cfg.get("wireless", {}).get("wireless_model", "simulated")).lower()
+    wsn_sampler = build_wsn_wireless_sampler(cfg) if wireless_model == "wsn" else None
+
+    local_epochs = int(cfg["fl"]["local_epochs"])
+    lr = float(cfg["fl"]["lr"])
+    num_clients = int(cfg["fl"]["num_clients"])
+    num_rounds = int(cfg["fl"]["num_rounds"])
+    resources = cfg["fl"].get("client_resources", {"num_cpus": 2, "num_gpus": 0.25})
 
     def client_fn(context: Context) -> fl.client.Client:
         cid = int(context.node_config.get("partition-id", context.node_id))
-        return CifarClient(cid, train_loaders[cid], test_loader, cfg.local_epochs, cfg.lr).to_client()
+        return CifarClient(cid, train_loaders[cid], test_loader, local_epochs, lr).to_client()
 
-    strategy = HybridWirelessStrategy(cfg, partition_sizes, test_loader, wsn_wireless_sampler=wsn_sampler)
-
+    strategy = build_strategy(strategy_name, cfg, partition_sizes, test_loader, wsn_wireless_sampler=wsn_sampler)
     fl.simulation.start_simulation(
         client_fn=client_fn,
-        num_clients=cfg.num_clients,
-        config=fl.server.ServerConfig(num_rounds=cfg.num_rounds),
+        num_clients=num_clients,
+        config=fl.server.ServerConfig(num_rounds=num_rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 2, "num_gpus": 0.25},
+        client_resources={"num_cpus": float(resources.get("num_cpus", 2)), "num_gpus": float(resources.get("num_gpus", 0.25))},
         ray_init_args={"include_dashboard": False},
     )
 
     final_acc = float(strategy.acc_history[-1]) if strategy.acc_history else 0.0
     avg_energy = float(np.mean(strategy.energy_history)) if strategy.energy_history else 0.0
-
     return {
         "final_accuracy": final_acc,
-        "mode_history": strategy.mode_history,
         "avg_energy": avg_energy,
+        "mode_history": strategy.mode_history,
+        "metrics_csv": strategy.metrics_path,
     }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Flower hybrid FL demo with non-IID CIFAR partition and simplified wireless modeling",
-    )
-    parser.add_argument("--num-clients", type=int, default=10)
-    parser.add_argument("--num-rounds", type=int, default=8)
-    parser.add_argument("--local-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--fraction-fit", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--data-dir", type=str, default=f"./data")
+    parser = argparse.ArgumentParser(description="Flower hybrid FL demo with strategy YAML + CLI overrides")
+    parser.add_argument("--strategy", type=str, default="hybrid_opt", choices=["hybrid_opt", "sync", "async", "bridge_free", "bandwidth_first", "energy_first"])
+    parser.add_argument("--config", type=str, default="", help="Optional explicit YAML path, default is src/configs/strategies/<strategy>.yaml")
 
-    # 新增超参
-    parser.add_argument("--selection-top-k", type=int, default=0,
-                        help="Top-K 客户端数，<=0 时使用 num_clients*fraction_fit")
-    parser.add_argument("--async-agg-interval", type=int, default=2,
-                        help="FedBuff 异步聚合的最小轮间隔")
-    parser.add_argument("--fair-window-size", type=int, default=4,
-                        help="Jain 公平性滑动窗口大小")
-    parser.add_argument("--fedprox-mu", type=float, default=0.0,
-                        help="FedProx 近端正则系数，0 则关闭")
-    parser.add_argument("--algorithm", type=str, default="fedavg",
-                        choices=["fedavg", "fedprox", "scaffold"],
-                        help="本地训练算法")
-    parser.add_argument("--semi-sync-wait-ratio", type=float, default=0.7,
-                        help="半同步等待的发送时间分位数比例")
-    parser.add_argument("--wireless-model", type=str, default="simulated", choices=["simulated", "wsn"],
-                        help="无线信道来源：模拟信道或 WSN 数据集信道")
-    parser.add_argument("--wsn-csv-path", type=str, default="",
-                        help="WSN CSV 路径（wireless-model=wsn 时必填）")
-    parser.add_argument("--wsn-snr-col", type=str, default="snr",
-                        help="WSN CSV 中 SNR 列名")
-    parser.add_argument("--wsn-rssi-col", type=str, default="rssi",
-                        help="WSN CSV 中 RSSI 列名（无 snr 列时用于推导）")
-    parser.add_argument("--wsn-noise-col", type=str, default="noise_floor",
-                        help="WSN CSV 中噪声底列名（无 snr 列时用于推导）")
-    parser.add_argument("--wsn-prr-col", type=str, default="prr",
-                        help="WSN CSV 中 PRR 列名（无 per 列时用于推导）")
-    parser.add_argument("--wsn-per-col", type=str, default="per",
-                        help="WSN CSV 中 PER 列名")
-    parser.add_argument("--initial-client-energy", type=float, default=100.0,
-                        help="每个客户端初始能量（默认所有客户端相同）")
-    parser.add_argument(
-        "--client-initial-energies",
-        type=str,
-        default="",
-        help="按客户端顺序指定初始能量，逗号分隔，例如: 120,100,80,60",
-    )
+    parser.add_argument("--num-clients", type=int, default=None)
+    parser.add_argument("--num-rounds", type=int, default=None)
+    parser.add_argument("--local-epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--alpha", type=float, default=None)
+    parser.add_argument("--fraction-fit", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--data-dir", type=str, default="")
+    parser.add_argument("--algorithm", type=str, default="", choices=["", "fedavg", "fedprox", "scaffold"])
+    parser.add_argument("--fedprox-mu", type=float, default=None)
 
+    parser.add_argument("--wireless-model", type=str, default="", choices=["", "simulated", "wsn"])
+    parser.add_argument("--simulated-mode", type=str, default="", choices=["", "good", "bad", "jitter"])
+    parser.add_argument("--jitter-period-rounds", type=int, default=None)
+    parser.add_argument("--jitter-start-state", type=str, default="", choices=["", "good", "bad"])
+    parser.add_argument("--wsn-csv-path", type=str, default="")
+    parser.add_argument("--selection-top-k", type=int, default=None)
+    parser.add_argument("--async-agg-interval", type=int, default=None)
+    parser.add_argument("--fair-window-size", type=int, default=None)
+    parser.add_argument("--semi-sync-wait-ratio", type=float, default=None)
+    parser.add_argument("--initial-client-energy", type=float, default=None)
+    parser.add_argument("--client-initial-energies", type=str, default="")
+    parser.add_argument("--client-num-cpus", type=float, default=None)
+    parser.add_argument("--client-num-gpus", type=float, default=None)
     return parser.parse_args()
 
 
 def _setup_logging() -> None:
-    import logging
-
     flwr_logger = logging.getLogger("flwr")
-    flwr_logger.propagate = False  # 防止再冒泡到 root 导致重复打印
+    flwr_logger.propagate = False
 
 
 def main() -> None:
     _setup_logging()
     args = parse_args()
-    custom_energies = None
-    if args.client_initial_energies.strip():
-        custom_energies = [
-            float(x.strip()) for x in args.client_initial_energies.split(",") if x.strip()
-        ]
-    wsn_csv_path = args.wsn_csv_path if args.wsn_csv_path.strip() else HybridCifarConfig().wsn_csv_path
-    cfg = HybridCifarConfig(
-        num_clients=args.num_clients,
-        num_rounds=args.num_rounds,
-        local_epochs=args.local_epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        alpha=args.alpha,
-        fraction_fit=args.fraction_fit,
-        seed=args.seed,
-        data_dir=args.data_dir,
-        selection_top_k=args.selection_top_k,
-        async_agg_interval=args.async_agg_interval,
-        fair_window_size=args.fair_window_size,
-        fedprox_mu=args.fedprox_mu,
-        algorithm=args.algorithm,
-        semi_sync_wait_ratio=args.semi_sync_wait_ratio,
-        wireless_model=args.wireless_model,
-        wsn_csv_path=wsn_csv_path,
-        wsn_snr_col=args.wsn_snr_col,
-        wsn_rssi_col=args.wsn_rssi_col,
-        wsn_noise_col=args.wsn_noise_col,
-        wsn_prr_col=args.wsn_prr_col,
-        wsn_per_col=args.wsn_per_col,
-        initial_client_energy=args.initial_client_energy,
-        client_initial_energies=custom_energies,
-    )
+    config_path = args.config.strip() or default_strategy_yaml(args.strategy)
+    cfg = load_strategy_yaml(config_path)
+    cfg = apply_cli_overrides(cfg, args)
 
-    result = run_hybrid_flower_cifar(cfg)
+    result = run_hybrid_flower_cifar(cfg, strategy_name=args.strategy)
     print(f"Final accuracy: {result['final_accuracy']:.4f}")
     print(f"Average energy: {result['avg_energy']:.4f}")
     print("Mode history:", ", ".join(result["mode_history"]))
+    print(f"Metrics CSV: {result['metrics_csv']}")
 
 
 if __name__ == "__main__":

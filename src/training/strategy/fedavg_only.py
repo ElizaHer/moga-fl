@@ -19,7 +19,7 @@ class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
         scheduled_cids = list(self.last_selected_cids)
         if not scheduled_cids:
             scheduled_cids = [int(res.metrics.get("cid", -1)) for _, res in results]
-            scheduled_cids = [cid for cid in scheduled_cids if 0 <= cid < self.cfg.num_clients]
+            scheduled_cids = [cid for cid in scheduled_cids if 0 <= cid < self.num_clients]
 
         wireless_stats = self.current_wireless_stats or self.channel.sample_round()
         per_values = [
@@ -42,7 +42,7 @@ class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
             threshold = float(
                 np.quantile(
                     np.asarray([tx_times[cid] for cid in scheduled_cids], dtype=np.float64),
-                    self.cfg.semi_sync_wait_ratio,
+                    self.semi_sync_wait_ratio,
                 )
             )
 
@@ -53,7 +53,7 @@ class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
 
         for _, fit_res in results:
             cid = int(fit_res.metrics.get("cid", -1))
-            if cid < 0 or cid >= self.cfg.num_clients:
+            if cid < 0 or cid >= self.num_clients:
                 continue
             num_examples = int(fit_res.num_examples)
             if num_examples <= 0:
@@ -75,7 +75,7 @@ class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
             weight = float(num_examples)
             valid_updates.append((ndarrays, weight))
 
-            if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None:
+            if self.algorithm == "scaffold" and self.scaffold_state is not None:
                 payload = fit_res.metrics.get("delta_ci", b"")
                 if isinstance(payload, (bytes, bytearray)) and len(payload) > 0:
                     delta_ci = unpack_tensor_dict(bytes(payload), torch.device("cpu"))
@@ -86,7 +86,7 @@ class FedAvgOnlyHybridStrategy(HybridWirelessStrategy):
         merged = self._weighted_avg(valid_updates, global_ndarrays) if valid_updates else global_ndarrays
         self.global_params_cache = ndarrays_to_parameters(merged)
 
-        if self.cfg.algorithm.lower() == "scaffold" and self.scaffold_state is not None and scaffold_deltas:
+        if self.algorithm == "scaffold" and self.scaffold_state is not None and scaffold_deltas:
             self.scaffold_state.update_global(scaffold_deltas, scaffold_weights)
 
         set_parameters(self.model_for_eval, merged)
