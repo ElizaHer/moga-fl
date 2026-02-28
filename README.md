@@ -68,6 +68,15 @@ python scripts/run_ga_optimization.py --config configs/quick_cifar10.yaml --gene
 
 ## 训练命令
 
+### 批量运行与对比
+
+Run the full sweep (strategies × modes × alphas × seeds)
+.\run_experiments.ps1
+
+Analyze the latest run
+python .\analyze_results.py
+
+
 ### 使用 WSN 无线数据集
 python .\src\flower\hybrid_opt_demo.py `
   --wireless-model wsn `

@@ -19,9 +19,9 @@ fl:
 
 wireless:
   wireless_model: simulated  # simulated / wsn
-  simulated_mode: good       # good / bad / jitter
+  simulated_mode: jitter     # good / bad / jitter
   jitter_period_rounds: 20
-  jitter_start_state: good
+  jitter_start_state: bad
   wsn_csv_path: ./data/wsn-indfeat-dataset/combined_wsn.csv
   wsn_snr_col: snr
   wsn_rssi_col: rssi
@@ -42,7 +42,7 @@ algorithm:
   fedprox_mu: 0.0
 
 energy:
-  initial_client_energy: 100.0
+  initial_client_energy: 2000.0
   client_initial_energies:
 
 scheduler:
@@ -71,6 +71,25 @@ controller:
   bandwidth_rebalance:
     low_energy_factor: 0.8
     high_energy_factor: 1.0
+  bridge_invariants:
+    enable: true
+    energy_budget_round: 120.0
+    upload_time_budget_round: 2.5
+    fairness_debt_trend: non_increasing
+    violation_weights:
+      budget: 0.5
+      stale: 0.3
+      fair: 0.2
+    thresholds:
+      th1: 0.10
+      th2: 0.25
+      th3: 0.45
+    downweight_factor: 0.5
+    throttle_drop_ratio: 0.3
+    rate_limit_factor: 0.8
+    bridge_extend_rounds: 1
+    max_bridge_rounds: 8
+    fail_streak_for_extend: 2
 
 fedbuff:
   buffer_size: 16

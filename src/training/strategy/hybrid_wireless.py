@@ -62,6 +62,14 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.mode_policy = str(controller_cfg.get("mode_policy", "hybrid")).lower()
         self.selection_policy = str(scheduler_cfg.get("selection_policy", "hybrid")).lower()
         self.wireless_model = str(wireless_cfg.get("wireless_model", "simulated")).lower()
+        self.bridge_inv_cfg = (
+            controller_cfg.get("bridge_invariants", {})
+            if isinstance(controller_cfg.get("bridge_invariants", {}), dict)
+            else {}
+        )
+        self.bridge_inv_enable = bool(self.bridge_inv_cfg.get("enable", False))
+        self.prev_mean_fair_debt: Optional[float] = None
+        self.bridge_fail_streak = 0
 
         weights = scheduler_cfg.get("weights", {}) if isinstance(scheduler_cfg.get("weights", {}), dict) else {}
         self.channel_w = float(weights.get("channel_w", 0.25))
@@ -217,6 +225,72 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                     out[i] += scale * arr.astype(np.float32, copy=False)
         return out
 
+    def _bridge_invariant_actions(
+        self,
+        *,
+        round_energy: float,
+        est_upload_time: float,
+        stale_max: int,
+        mean_fair_debt: float,
+    ) -> Dict[str, bool]:
+        actions = {"downweight": False, "throttle": False, "extend_bridge": False}
+        if not self.bridge_inv_enable or self.current_mode != "bridge":
+            self.prev_mean_fair_debt = mean_fair_debt
+            return actions
+
+        energy_budget = float(self.bridge_inv_cfg.get("energy_budget_round", 120.0))
+        upload_budget = float(self.bridge_inv_cfg.get("upload_time_budget_round", 2.5))
+        w_cfg = self.bridge_inv_cfg.get("violation_weights", {}) if isinstance(self.bridge_inv_cfg.get("violation_weights", {}), dict) else {}
+        t_cfg = self.bridge_inv_cfg.get("thresholds", {}) if isinstance(self.bridge_inv_cfg.get("thresholds", {}), dict) else {}
+        w_budget = float(w_cfg.get("budget", 0.5))
+        w_stale = float(w_cfg.get("stale", 0.3))
+        w_fair = float(w_cfg.get("fair", 0.2))
+        th1 = float(t_cfg.get("th1", 0.10))
+        th2 = float(t_cfg.get("th2", 0.25))
+        th3 = float(t_cfg.get("th3", 0.45))
+
+        v_budget = max(0.0, round_energy / max(1e-12, energy_budget) - 1.0) + max(
+            0.0, est_upload_time / max(1e-12, upload_budget) - 1.0
+        )
+        v_stale = max(0.0, float(stale_max) / max(1.0, float(self.fedbuff.max_staleness)) - 1.0)
+        prev = self.prev_mean_fair_debt if self.prev_mean_fair_debt is not None else mean_fair_debt
+        trend = str(self.bridge_inv_cfg.get("fairness_debt_trend", "non_increasing")).lower()
+        v_fair = max(0.0, mean_fair_debt - prev) if trend == "non_increasing" else 0.0
+
+        v_total = w_budget * v_budget + w_stale * v_stale + w_fair * v_fair
+        if v_total >= th1:
+            actions["downweight"] = True
+        if v_total >= th2:
+            actions["throttle"] = True
+        if v_total >= th3:
+            actions["extend_bridge"] = True
+
+        if any(actions.values()):
+            self.bridge_fail_streak += 1
+        else:
+            self.bridge_fail_streak = 0
+
+        if self.bridge_fail_streak >= int(self.bridge_inv_cfg.get("fail_streak_for_extend", 2)):
+            actions["extend_bridge"] = True
+
+        if actions["extend_bridge"]:
+            extra = int(self.bridge_inv_cfg.get("bridge_extend_rounds", 1))
+            max_bridge = int(self.bridge_inv_cfg.get("max_bridge_rounds", 8))
+            self.controller.bridge_rounds = min(max_bridge, int(self.controller.bridge_rounds) + max(1, extra))
+
+        if actions["throttle"]:
+            rate_limit = float(self.bridge_inv_cfg.get("rate_limit_factor", 0.8))
+            self.current_bw_factor = float(np.clip(self.current_bw_factor * rate_limit, 0.1, 1.0))
+
+        print(
+            f"[round {len(self.acc_history)+1}] bridge_invariants: "
+            f"actions={actions}, energy={round_energy:.4f}, upload={est_upload_time:.4f}, "
+            f"stale_max={stale_max}, mean_fair_debt={mean_fair_debt:.4f}, "
+            f"bridge_rounds={self.controller.bridge_rounds}"
+        )
+        self.prev_mean_fair_debt = mean_fair_debt
+        return actions
+
     def _decide_mode(self, server_round: int) -> Tuple[str, float, float]:
         if self.mode_policy == "semi_sync":
             return "semi_sync", 0.0, self.controller._bandwidth_factor()
@@ -365,11 +439,8 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             tx_list = [tx_times[cid] for cid in scheduled_cids]
             threshold = float(np.quantile(np.asarray(tx_list, dtype=np.float64), self.semi_sync_wait_ratio))
 
-        valid_sync_updates: List[Tuple[List[np.ndarray], float]] = []
-        scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
-        scaffold_weights: Dict[int, float] = {}
+        candidate_updates: List[Dict[str, object]] = []
         round_energy = 0.0
-
         for _, fit_res in results:
             cid = int(fit_res.metrics.get("cid", -1))
             if cid < 0 or cid >= self.num_clients or cid in self.exhausted_clients:
@@ -389,24 +460,76 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                 self.exhausted_clients.add(cid)
                 continue
 
-            if np.random.rand() < per:
-                continue
-
             ndarrays = parameters_to_ndarrays(fit_res.parameters)
             weight = float(num_examples)
+            payload = fit_res.metrics.get("delta_ci", b"")
+            candidate_updates.append(
+                {
+                    "cid": cid,
+                    "num_examples": num_examples,
+                    "tx_time": tx_time,
+                    "per": per,
+                    "ndarrays": ndarrays,
+                    "weight": weight,
+                    "delta_ci_payload": payload,
+                }
+            )
+
+        stale_max = max([int(s) for _, s, _ in self.fedbuff.entries], default=0)
+        mean_fair_debt = float(np.mean(self._compute_fairness_debt()))
+        actions = self._bridge_invariant_actions(
+            round_energy=round_energy,
+            est_upload_time=est_upload_time,
+            stale_max=stale_max,
+            mean_fair_debt=mean_fair_debt,
+        )
+
+        risk_scores: Dict[int, float] = {}
+        if candidate_updates:
+            max_tx = max(float(u["tx_time"]) for u in candidate_updates)
+            for u in candidate_updates:
+                cid = int(u["cid"])
+                tx_norm = float(u["tx_time"]) / max(1e-12, max_tx)
+                per_v = float(u["per"])
+                energy_rem = float(self.client_energy.get(cid, 0.0))
+                energy_risk = 1.0 - float(np.clip(energy_rem / max(1e-12, self.initial_client_energy), 0.0, 1.0))
+                risk_scores[cid] = 0.45 * tx_norm + 0.35 * per_v + 0.20 * energy_risk
+
+        throttle_drop: set[int] = set()
+        if actions["throttle"] and candidate_updates:
+            ratio = float(self.bridge_inv_cfg.get("throttle_drop_ratio", 0.3))
+            drop_n = max(1, int(round(len(candidate_updates) * np.clip(ratio, 0.0, 0.9))))
+            ranked = sorted(candidate_updates, key=lambda u: risk_scores.get(int(u["cid"]), 0.0), reverse=True)
+            throttle_drop = {int(u["cid"]) for u in ranked[:drop_n]}
+
+        valid_sync_updates: List[Tuple[List[np.ndarray], float]] = []
+        scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
+        scaffold_weights: Dict[int, float] = {}
+        for u in candidate_updates:
+            cid = int(u["cid"])
+            if cid in throttle_drop:
+                continue
+            if np.random.rand() < float(u["per"]):
+                continue
+
+            weight = float(u["weight"])
+            if actions["downweight"]:
+                factor = float(self.bridge_inv_cfg.get("downweight_factor", 0.5))
+                r = float(risk_scores.get(cid, 0.0))
+                weight = weight * (1.0 - (1.0 - factor) * np.clip(r, 0.0, 1.0))
 
             if self.algorithm == "scaffold" and self.scaffold_state is not None:
-                payload = fit_res.metrics.get("delta_ci", b"")
+                payload = u["delta_ci_payload"]
                 if isinstance(payload, (bytes, bytearray)) and len(payload) > 0:
                     delta_ci = unpack_tensor_dict(bytes(payload), torch.device("cpu"))
                     if delta_ci:
                         scaffold_deltas[cid] = delta_ci
                         scaffold_weights[cid] = weight
 
-            self.fedbuff.push(ndarrays, num_examples)
-            if self.current_mode in ("semi_sync", "bridge") and tx_time > threshold:
+            self.fedbuff.push(u["ndarrays"], int(u["num_examples"]))
+            if self.current_mode in ("semi_sync", "bridge") and float(u["tx_time"]) > threshold:
                 continue
-            valid_sync_updates.append((ndarrays, weight))
+            valid_sync_updates.append((u["ndarrays"], weight))
 
         sync_result = self._weighted_avg(valid_sync_updates, global_ndarrays) if valid_sync_updates else global_ndarrays
         async_result = global_ndarrays
