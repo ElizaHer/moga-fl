@@ -193,7 +193,7 @@ print(resp.content.decode())
   - `README.md` with run tag, key params, why accepted, key metrics.
 - After archival, create a git commit including these accepted params/results for downstream processing.
 - Suggested commit message:
-  - `feat(exp): archive accepted hybrid matrix results and tuned configs (<run_tag>)`
+  - `auto(exp): archive accepted hybrid matrix results and tuned configs (<run_tag>)`
 
 ## 8. Script Self-Repair Policy
 - If runner scripts mis-handle strategy metric folders or success criteria, agent must patch scripts.
@@ -213,4 +213,12 @@ print(resp.content.decode())
 
 ## 10. Server Access
 - Passwordless server connection command:
-  - `ssh -p 49692 root@connect.bjb2.seetacloud.com`
+  - `ssh -p 14863 root@connect.bjb2.seetacloud.com`
+
+## 11. Latest Run Log (2026-03-03)
+- Run#1: `outputs/fl_comp/20260303_014057/B_matrix_tuned`
+- Run#2 (tuned A2): `outputs/fl_comp/20260303_034927/B_matrix_tuned_A2`
+- Acceptance archive: `outputs/fl_comp/20260303_034927/accepted/`
+- Round validation: selected CSV final round all `>=60` in both runs.
+- Retry stats: both runs achieved `11/11` success with single attempt per job.
+- Current status: `hybrid_jitter_invFalse` is strongest in jitter accuracy; `hybrid_jitter_invTrue` still underperforms top baselines and needs further bridge-invariants tuning.

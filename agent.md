@@ -114,8 +114,15 @@ If results are considered expected/qualified:
    - `README.md` describing acceptance rationale and key metrics.
 3. Commit accepted artifacts to git for downstream processing.
    - Example commit message:
-   - `feat(exp): archive accepted hybrid matrix results and tuned configs (<run_tag>)`
+   - `auto(exp): archive accepted hybrid matrix results and tuned configs (<run_tag>)`
 
 ## Server Login (Passwordless)
 Use this command to connect server:
-`ssh -p 49692 root@connect.bjb2.seetacloud.com`
+`ssh -p 14863 root@connect.bjb2.seetacloud.com`
+
+## 2026-03-03 Execution Record
+- Remote login switched to: `ssh -p 14863 root@connect.bjb2.seetacloud.com`
+- Added strict matrix runner: `scripts/run_matrix_tuned.py`
+- Completed run `20260303_014057/B_matrix_tuned` and rerun `20260303_034927/B_matrix_tuned_A2`
+- Both runs produced full ledgers/manifests/summaries/plots; second run archived to `outputs/fl_comp/20260303_034927/accepted/`
+- Note: explicit matrix list counts 10 while doc says 11; added `hybrid_wsn_invFalse` as disambiguation to satisfy 11-job constraint.
