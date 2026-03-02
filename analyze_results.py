@@ -30,6 +30,8 @@ def summarize_csv(path: str) -> dict:
     df = pd.read_csv(path)
     if "round" not in df.columns:
         return {}
+    if df.shape[0] == 0:
+        return {}
     df = df.sort_values("round")
     last = df.iloc[-1]
     return {
