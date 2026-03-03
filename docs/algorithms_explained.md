@@ -1,15 +1,19 @@
 # 联邦学习调度与优化算法说明（门控切换 / 半同步 / 异步 / MOGA‑FL）
 
-> 面向毕设论文与答辩的“算法讲解稿”，对应当前代码工程中的关键实现。
+> 面向毕设论文与答辩的算法讲解，对应当前代码工程中的关键实现。
 >
 > 对照代码位置：
-> - 门控切换策略：`src/training/strategy_controller.py`、`src/training/server.py`、`src/training/aggregator.py`
-> - 半同步聚合：`Server.round()` + `Aggregator.aggregate()` 的 `semi_sync` 分支
-> - 异步聚合（FedBuff 风格）：`src/training/algorithms/fedbuff.py` + `Aggregator.aggregate()` 的 `async` 分支
-> - 桥接态与混合聚合：`StrategyController` 的状态机 + `Aggregator` 的 `bridge` 分支
-> - 多目标遗传算法（MOGA‑FL）：`src/ga/moga_fl.py` + `nsga3.py` + `moead.py` + `objectives.py` + `constraints.py`
-> - 无线建模：`src/wireless/channel.py` + `src/wireless/channel_models.py`
-> - FedProx / SCAFFOLD：`src/training/client.py` + `src/training/algorithms/fedprox.py` + `src/training/algorithms/scaffold.py`
+> - 混合策略（含门控）：`src/training/strategy/hybrid_wireless.py`
+> - 调度与选择门：`src/scheduling/gate.py`
+> - 异步聚合（FedBuff）：`src/training/algorithms/fedbuff.py`
+> - 多目标遗传算法（MOGA‑FL）：
+>   - 评估器：`src/ga/sim_runner_flower.py`
+>   - 优化器：`src/ga/moga_fl.py` + `nsga3.py` + `moead.py`
+>   - 可选 `pymoo` 优化器：`src/ga/pymoo_nsga3.py`
+> - 无线建模：
+>   - WSN: `data/wsn-indfeat-dataset/combined_wsn.csv`
+>   - Simulated: `src/wireless/channel.py` + `src/wireless/channel_models.py`
+> - FedProx / SCAFFOLD：`src/training/algorithms/fedprox.py` + `scaffold.py`
 
 ---
 
@@ -23,7 +27,7 @@
 - 公平性差（Jain 指数低），意味着“强设备垄断训练、弱设备长期被冷落”；
 - 能量消耗高，意味着继续保持“高强度训练”会拉高成本。
 
-为此，`StrategyController`（`src/training/strategy_controller.py`）为每一轮维护一个滑动窗口，记录三类指标：
+为此，`ModeController`（`src/scheduling/gate.py`）为每一轮维护一个滑动窗口，记录三类指标：
 
 - `avg_per`：最近几轮的平均丢包率；
 - `jain`：最近几轮的 Jain 公平指数（由选择历史计算）；
@@ -39,7 +43,7 @@
 
 ### 1.2 状态机：semi_sync / async / bridge
 
-`StrategyController.decide_mode()` 内部维护一个简单的三态状态机：
+`ModeController.decide()` 内部维护一个简单的三态状态机：
 
 - `semi_sync`：半同步模式，适用于中低丢包、网络相对稳定时；
 - `async`：异步模式，适用于高丢包、强异构场景；
@@ -53,8 +57,8 @@
    - 否则保持当前模式。
 2. 为了防止频繁来回切换，使用 `min_rounds_between_switch` 限制两次切换之间的最小间隔；在间隔期内，即便 gate_score 有轻微波动，也不会立刻改模式，从而起到“防抖”作用。
 3. 当目标模式与当前模式不同，状态机会先进入 `bridge`，并记录 `bridge_start_round` 与 `bridge_rounds`（桥接需要持续多少轮）：
-   - 在桥接期间，通过 `_current_mode_and_bridge_weight()` 输出一个从 0 逐渐增大的 `bridge_weight`；
-   - 聚合时，`Aggregator` 会用这个权重在“半同步结果”和“异步缓冲结果”之间做线性插值，实现“调音台式权重混合”；
+   - 在桥接期间，通过 `decide()` 输出一个从 0 逐渐增大的 `bridge_weight`；
+   - 聚合时，`HybridWirelessStrategy` 会用这个权重在“半同步结果”和“异步缓冲结果”之间做线性插值，实现“调音台式权重混合”；
    - 桥接轮数跑完后，模式正式切换到目标模式。
 
 可以把这套逻辑理解为一个“自动变速箱”：半同步是高档、异步是低档，桥接态是“踩着离合器平滑换挡”。
@@ -66,25 +70,25 @@
 - 能量消耗高 → 降低 `bandwidth_factor`，减少每轮带宽预算；
 - 能量压力小 → 提高 `bandwidth_factor`，恢复到较高带宽水平。
 
-`Server.round()` 会在每轮临时将 `BandwidthAllocator.budget_mb` 乘以 `bandwidth_factor`，用“更紧或更松”的带宽预算驱动客户端传输时间与能耗，从而形成一个轻量的“能量/带宽预算再平衡”回路。
+`HybridWirelessStrategy` 会在每轮临时将 `BandwidthAllocator.budget_mb` 乘以 `bandwidth_factor`，用“更紧或更松”的带宽预算驱动客户端传输时间与能耗，从而形成一个轻量的“能量/带宽预算再平衡”回路。
 
 ---
 
 ## 2. 半同步聚合算法（对应中低丢包场景）
 
-半同步模式由 `Server.round()` 和 `Aggregator.aggregate()` 联合实现。
+半同步模式由 `HybridWirelessStrategy.aggregate_fit()` 实现。
 
 ### 2.1 等待比例与按时返回客户端集合
 
-在 `Server.round()` 中：
+在 `aggregate_fit()` 中：
 
 1. 先通过 `ChannelSimulator.sample_round()` 为每个客户端生成本轮的信道统计：`snr_db`、`per`、`distance_m`。
-2. 根据调度评分（能量、信道、数据价值、公平债务、带宽成本）选出 Top‑K 客户端 `selected`；
+2. 根据调度评分（能量、信道、数据价值、公平债务）选出 Top‑K 客户端 `selected_cids`；
 3. 用 `BandwidthAllocator` 按选中客户端平均分配带宽，并估算每个客户端的发送时间 `tx_time[cid]`；
 4. 在半同步模式下，根据配置的 `semi_sync_wait_ratio`（例如 0.7）计算发送时间分位数：
    - 取 `tx_time` 的 70% 分位数作为“等待阈值”；
-   - 将发送时间不超过阈值的客户端组成 `on_time_clients` 集合；
-   - 在本轮训练中，只允许 `on_time_clients` 参与同步聚合，其余客户端视为“迟到”，本轮跳过。
+   - 将发送时间不超过阈值的客户端视为“按时”，其余客户端视为“迟到”；
+   - 在本轮训练中，只允许“按时”的客户端参与同步聚合，迟到的客户端更新虽然也被接收，但不会计入本轮的同步部分。
 
 直观地说，这就像设定一个“迟到线”：只要在合理时间内能把梯度传回来的客户端都算“按时”，其余则延后。
 
@@ -94,10 +98,10 @@
 
 1. 服务器将全局模型参数下发给每个客户端；
 2. 客户端执行本地训练（算法为 FedAvg 或 FedProx），返回本地模型参数；
-3. `Aggregator.aggregate()` 在 `sync`/`semi_sync` 模式下直接调用 `aggregate_fedavg`：
+3. `HybridWirelessStrategy.aggregate_fit()` 在 `sync`/`semi_sync` 模式下直接调用 `_weighted_avg`：
    - 按客户端样本数加权平均各自模型参数，得到新的全局参数；
-4. 同时，`Server.round()` 会估算：
-   - 本轮总通信时间 `comm_time`（按 1MB 载荷和分配带宽近似）；
+4. 同时，`HybridWirelessStrategy` 会估算：
+   - 本轮总通信时间 `est_upload_time`；
    - 通信能耗 `comm_energy`（功率×时间）；
    - 计算能耗 `comp_energy`（按处理样本数近似）；
    - 并写入 `metrics.csv`，供后续 GA 优化与仪表盘使用。
@@ -108,19 +112,20 @@
 
 ## 3. 异步聚合算法（FedBuff 风格，对应高丢包场景）
 
-异步聚合由 `FedBuffBuffer`（`src/training/algorithms/fedbuff.py`）和 `Aggregator.aggregate()` 的 `async` 分支共同实现。
+异步聚合由 `FedBuffState`（`src/training/algorithms/fedbuff.py`）和 `HybridWirelessStrategy.aggregate_fit()` 的 `async` 分支共同实现。
 
 ### 3.1 FedBuff 缓冲结构与陈旧度
 
-`FedBuffBuffer` 内部维护一个队列 `entries = [(state_dict, staleness), ...]`：
+`FedBuffState` 内部维护一个队列 `entries = [(state_dict, num_examples, server_round), ...]`：
 
 - `state_dict`：客户端本地训练后的模型参数；
-- `staleness`：该更新相对于当前全局轮次的“陈旧度”，即延迟的轮数。
+- `num_examples`：对应的样本数；
+- `server_round`：更新到达时的服务器轮次。
 
-在 `Aggregator.aggregate()` 的异步路径中：
+在 `aggregate_fit()` 的异步路径中：
 
-1. 每轮开头，根据轮次差值调用 `buffer.age_entries(delta)`，将缓冲中所有条目的 `staleness` 增大 `delta`；若 `staleness` 超过 `max_staleness`，该条目会被丢弃；
-2. 本轮新到的更新会通过 `buffer.push(sd, st)` 加入队列，初始 `staleness=0`；
+1. 每轮开头，调用 `fedbuff.age()`，更新缓冲中所有条目的陈旧度；若 `staleness` 超过 `max_staleness`，该条目会被丢弃；
+2. 本轮新到的有效更新会通过 `fedbuff.push()` 加入队列；
 3. 当满足以下任一条件时触发一次聚合：
    - 缓冲长度达到 `buffer_size`；
    - 自上次聚合以来累计更新数达到 `min_updates_to_aggregate`；
@@ -128,10 +133,10 @@
 
 ### 3.2 陈旧度加权与聚合
 
-触发聚合时，`buffer.aggregate(global_state)` 会：
+触发聚合时，`fedbuff.aggregate()` 会：
 
-1. 遍历缓冲中的所有条目 `(sd, staleness)`；
-2. 为每个条目分配权重 `w = 1 / (1 + staleness)^alpha`（`alpha` 在配置中为 `staleness_alpha`）；
+1. 遍历缓冲中的所有条目，计算其相对于当前轮次的 `staleness`；
+2. 为每个条目分配权重 `w = num_examples / (1 + staleness)^alpha`（`alpha` 在配置中为 `staleness_alpha`）；
 3. 按这些权重对所有 `state_dict` 做加权平均，得到新的全局模型；
 4. 清空缓冲，为下一轮积累新更新。
 
@@ -139,10 +144,10 @@
 
 ### 3.3 异步模式下的服务器行为
 
-在 `Server.round()` 中，当策略控制器给出的模式为 `async` 时：
+在 `HybridWirelessStrategy` 中，当策略控制器给出的模式为 `async` 时：
 
 - 每轮仍然会进行调度、发模型、收更新，但收不到更新的客户端可以长期“缺席”；
-- `Aggregator.aggregate()` 会将收到的更新累积到 FedBuff 缓冲中，只有缓冲“积累到一定程度”时才推进一次全局模型；
+- `aggregate_fit()` 会将收到的更新累积到 FedBuff 缓冲中，只有缓冲“积累到一定程度”时才推进一次全局模型；
 - 即便某些客户端长期丢包，只要还有一部分客户端能稳定上传更新，训练就能持续向前推进。
 
 ---
@@ -155,8 +160,8 @@
 
 在代码中，桥接态主要体现在两个地方：
 
-1. `StrategyController` 将当前模式设为 `bridge`，并随轮数输出从 0→1 的 `bridge_weight`；
-2. `Aggregator.aggregate()` 中，对于 `mode == 'bridge'` 的情况，会同时计算：
+1. `ModeController` 将当前模式设为 `bridge`，并随轮数输出从 0→1 的 `bridge_weight`；
+2. `HybridWirelessStrategy.aggregate_fit()` 中，对于 `mode == 'bridge'` 的情况，会同时计算：
    - `sync_result`：本轮按时返回客户端的 FedAvg 同步结果；
    - `async_result`：FedBuff 缓冲当前给出的异步结果；
    - 最终全局模型：`mixed = (1-w)*sync_result + w*async_result`。
@@ -166,7 +171,7 @@
 - 精度曲线不会出现强烈的“断崖式跳变”；
 - 通信时间与能耗的统计也会有一个缓慢的过渡过程，而不是瞬间翻倍或腰斩。
 
-同时，`StrategyController` 中还通过：
+同时，`ModeController` 中还通过：
 
 - `min_rounds_between_switch`：限制切换频率，避免来回抖动；
 - `bandwidth_factor`：在桥接期对带宽进行适度缩放，起到“预算再平衡”的作用；
@@ -263,14 +268,14 @@
 
 相关代码：
 
-- 本地训练：`src/training/client.py` 中的 `Client.local_train()`；
+- 本地训练：`src/training/client.py` 中的 `CifarClient.fit()`；
 - 近端正则计算：`src/training/algorithms/fedprox.py` 中的 `fedprox_regularizer()`。
 
-当配置 `training.algorithm: fedprox` 且 `fedprox_mu>0` 时：
+当配置 `algorithm.name: fedprox` 且 `fedprox_mu>0` 时：
 
 - 客户端本地目标变为：`f_k(w) + μ/2 ||w - w_global||^2`；
-- 代码中在交叉熵损失 `loss` 上叠加 `fedprox_regularizer(self.model, global_state, mu, device)`；
-- 其中 `global_state` 是当前轮下发的全局参数，`μ` 由配置 `fedprox_mu` 控制。
+- 代码中在交叉熵损失 `loss` 上叠加 `fedprox_regularizer(self.model, global_params, mu, self.device)`；
+- 其中 `global_params` 是当前轮下发的全局参数，`μ` 由配置 `fedprox_mu` 控制。
 
 直观理解：FedProx 会惩罚“偏离当前全局模型太远的本地更新”，从而在数据分布高度不均（non‑IID）时缓解局部模型过拟合自身数据的问题，有助于提高全局收敛稳定性。
 
@@ -279,22 +284,22 @@
 相关代码：
 
 - 控制变元状态：`src/training/algorithms/scaffold.py` 中的 `ScaffoldState`；
-- SCAFFOLD 本地训练：`Client.local_train_scaffold()`；
-- 服务器整合：`Server.__init__` 与 `Server.round()` 中处理 `algorithm == 'scaffold'` 的分支。
+- SCAFFOLD 本地训练：`src/training/client.py` 中的 `CifarClient.fit()`；
+- 服务器整合：`HybridWirelessStrategy` 中处理 `algorithm == 'scaffold'` 的分支。
 
 实现要点：
 
 1. **控制向量初始化**：
-   - 服务器创建 `ScaffoldState(self.global_state)`，生成与模型参数同形状的 `c_global`（全 0）和每个客户端的 `c_i`（懒初始化时为 0）。
+   - 服务器创建 `ScaffoldState(global_model_state)`，生成与模型参数同形状的 `c_global`（全 0）和每个客户端的 `c_i`（懒初始化时为 0）。
 2. **本地训练中的梯度校正**：
-   - 在 `local_train_scaffold()` 中，客户端先从 `ScaffoldState` 取出 `c_global` 和自身的 `c_i`；
+   - 在 `fit()` 中，客户端从服务器下发的 `config` 中解包 `c_global`，并从自身状态中取出 `c_i`；
    - 正常反向传播得到梯度后，对每个参数执行：`grad ← grad + (c_i - c_global)`；
    - 这样更新规则变为 `w ← w - η (g - c + c_i)`，对应论文中的控制变元修正项，可显著减缓 non‑IID 导致的客户端漂移。
 3. **Δc_i 的计算与回传**：
    - 本地训练结束后，客户端将最终本地参数 `w_local` 和训练步数 `num_steps` 交给 `ScaffoldState.compute_delta_ci`；
    - 该函数按论文的近似公式：`c_i^{new} = c_i - c + (1/(η·τ))(w_global - w_local)` 计算新的 `c_i`，并返回 Δc_i；
 4. **服务器端更新全局控制向量**：
-   - 在 `Server.round()` 聚合完模型参数之后，收集所有参与客户端的 Δc_i，按样本数加权平均；
+   - 在 `HybridWirelessStrategy.aggregate_fit()` 聚合完模型参数之后，收集所有参与客户端的 Δc_i，按样本数加权平均；
    - 调用 `ScaffoldState.update_global(delta_list, weights)` 更新 `c_global`。
 
 这样，FedProx 和 SCAFFOLD 分别从“损失函数层面”和“梯度层面”双重修正 non‑IID 带来的训练不稳定性，且都与门控切换和半同步/异步聚合兼容。
@@ -305,39 +310,45 @@
 
 相关代码集中在 `src/ga/`：
 
-- `objectives.py`：定义四个目标指标（精度、时间/轮数、公平性、能耗）；
+- `objectives.py`：定义四个目标指标（精度、时间、公平性、能耗）；
 - `constraints.py`：实现能耗预算等约束的惩罚与参数修复；
 - `nsga3.py`：简化版 NSGA‑III 风格优化器（保持非支配解多样性）；
 - `moead.py`：简化版 MOEA/D 风格优化器（基于权重向量的分解与邻域更新）；
 - `moga_fl.py`：`MOGAFLController`，组合 NSGA‑III + MOEA/D + 岛屿模型 + 局部搜索 + 多保真评估；
+- `pymoo_nsga3.py`：可选的、基于 `pymoo` 库的 NSGA-III 实现，鲁棒性更强；
 - `scripts/run_ga_optimization.py`：GA 入口脚本，负责调用评估器并将最优解写回配置。
 
 ### 6.1 个体编码：要优化哪些参数？
 
 在 `MOGAFLController._random_individual()` 中，一个候选解（染色体）包含：
 
-- 调度评分权重：`energy_w, channel_w, data_w, fair_w, bwcost_w`，分别对应能量、信道质量、数据价值、公平债务与带宽成本；
-- Top‑K 相关参数：`selection_top_k`（每轮选多少客户端）、`hysteresis`（选择防抖的迟滞系数）；
+- 调度评分权重：`energy_w, channel_w, data_w, fair_w`，分别对应能量、信道质量、数据价值与公平债务；
+- Top‑K 相关参数：`selection_top_k`（每轮选多少客户端）；
 - 异步相关参数：`staleness_alpha`（陈旧度加权的指数）。
+
+（注：原设计中的 `bwcost_w` 与 `hysteresis` 已移除，因其在当前 `HybridWirelessStrategy` 中没有直接的应用入口，为简化搜索空间故去除。）
 
 这些变量共同决定了：
 
 - 哪些客户端更容易被选中参与训练；
-- 半同步/异步切换时队列的稳定性；
-- 在高丢包场景下，旧梯度对新模型的贡献大小。
+- 异步聚合时，旧梯度对新模型的贡献大小。
 
 ### 6.2 多目标评估：四个维度的折衷
 
-`objectives.evaluate_solution()` 封装了运行短轮联邦训练的过程：
+`objectives.evaluate_solution()` 封装了调用评估“信使”的过程，该“信使”实际运行一个短轮联邦训练：
 
-- 给定一组参数，构造一个缩短轮数的“低保真模拟器”，运行若干轮训练；
-- 输出四个目标：
+- **评估器**：`src/ga/sim_runner_flower.py` 中的 `make_flower_sim_runner` 负责构造一个基于 Flower 的仿真运行器。它会：
+  1. 启动一个与 `hybrid_opt_demo.py` 类似的 Flower 仿真；
+  2. 根据 GA 个体提供的参数，动态修改仿真配置（如调度权重、Top-K 等）；
+  3. 运行一个缩短轮数的“低保真”或完整轮数的“高保真”训练；
+  4. 训练结束后，读取策略（`HybridWirelessStrategy`）输出的 `metrics.csv` 文件。
+- **指标聚合**：从 `metrics.csv` 中读取 `accuracy`, `est_upload_time`, `jain`, `energy` 列，计算其均值作为最终的四个目标：
   - `acc`：全局精度（希望越大越好）；
-  - `time`：通信时间或轮数（希望越小越好）；
+  - `time`：通信时间（希望越小越好）；
   - `fairness`：Jain 指数等公平性度量（希望越大越好）；
   - `energy`：能耗（通信 + 计算，越小越好）。
 
-`constraints.penalty()` 会根据能耗是否超过预算等条件给出一个惩罚值，并在指标中略微拉高 `energy`，从而在优化过程中自然排斥超预算解；`repair()` 则负责修复不合法的参数（例如 Top‑K 至少为 1、迟滞在 [0, 0.2] 区间）。
+`constraints.penalty()` 会根据能耗是否超过预算（优先从 `controller.bridge_invariants.energy_budget_round` 读取预算）给出一个惩罚值，并在指标中略微拉高 `energy`，从而在优化过程中自然排斥超预算解；`repair()` 则负责修复不合法的参数（例如 Top‑K 至少为 1、陈旧度指数在 [0.5, 2.0] 区间）。
 
 ### 6.3 NSGA‑III 岛屿：保持多样性
 
@@ -345,11 +356,13 @@
 
 - 初始化种群，随机采样一批候选参数；
 - 每一代：
-  1. 用 `evaluate()` 计算每个个体的多目标指标和惩罚；
+  1. 用 `evaluate_solution()` 计算每个个体的多目标指标和惩罚；
   2. 使用 `non_dominated_set()` 选出当前非支配解集合（即 Pareto 前沿）；
   3. 以这些非支配解为核心，随机交叉 + 变异生成下一代，保持种群多样性。
 
 在 `MOGAFLController._run_nsga3_island()` 中，这个 NSGA‑III 岛屿被用作“广度优先探索器”：在较小代数下找到覆盖面较广的 Pareto 候选，为后续 MOEA/D 岛屿提供好的起点。
+
+此外，我们还引入了基于 `pymoo` 库的 NSGA-III 实现 (`src/ga/pymoo_nsga3.py`) 作为可选项。`pymoo` 是一个成熟的多目标优化库，其 NSGA-III 实现比我们的简化版更鲁棒，尤其在处理约束和多样性维持方面。用户可以通过 `--algo pymoo_nsga3` 命令行选项来启用它，以应对更复杂的搜索场景。
 
 ### 6.4 MOEA/D 岛屿：加速收敛
 
@@ -375,7 +388,7 @@
    - 将两个岛屿的候选合并为大种群 `all_pop`；
 5. 局部搜索（Memetic）：
    - 在 `non_dominated_set(all_metrics_low)` 得到的低保真非支配精英附近做小范围扰动，得到邻域解 `neighbors`；
-   - 扰动时对权重做微小高斯噪声并重新归一化，对 Top‑K、hysteresis、staleness_alpha 做轻微调整；
+   - 扰动时对权重做微小高斯噪声并重新归一化，对 Top‑K、staleness_alpha 做轻微调整；
 6. 多保真评估：
    - 对“精英 + 邻域”组合使用高保真评估器（完整轮数或更长训练）重新评估；
    - 再次取 Pareto 前沿，作为最终 MOGA‑FL 输出的候选解集合。
@@ -384,27 +397,38 @@
 
 入口脚本 `scripts/run_ga_optimization.py` 负责完成“从搜索到部署”的闭环：
 
-1. 构造低保真与高保真评估器 `low_sim` / `high_sim`：
-   - `low_sim`：缩短轮数、减少客户端数，用于快速粗评估；
-   - `high_sim`：使用原配置的轮数和客户端数，对少数精英解高保真评估；
-2. 调用 `MOGAFLController.run()` 获得 Pareto 候选解及其指标；
-3. 根据 `eval.preference`（`time` / `fairness` / `energy` 等）对候选解做简单加权评分，选出一个“偏好最优”解；
+1. 使用 `src/configs/strategy_runtime.load_strategy_yaml` 加载策略配置，并通过 `src/ga/sim_runner_flower.make_flower_sim_runner` 构造低保真与高保真评估器；
+2. 调用 `MOGAFLController.run()` 或其他 GA 算法获得 Pareto 候选解及其指标；
+3. 根据配置中的 `preference`（`time` / `fairness` / `energy` 等）对候选解做简单加权评分，选出一个“偏好最优”解；
 4. 将该解中的参数写入 `outputs/results/best_moga_fl_config.yaml`：
-   - `scheduling.weights.*`：覆盖能量/信道/数据价值/公平债务/带宽成本权重；
-   - `clients.selection_top_k`、`clients.hysteresis`：覆盖调度 Top‑K 与防抖参数；
-   - `training.fedbuff.staleness_alpha`：覆盖异步陈旧度加权参数；
-5. 最终，用户可以直接使用这个 best 配置重新运行 `scripts/run_baselines.py`，即完成“经 GA 优化后的联邦训练部署”。
+   - `scheduler.weights.*`：覆盖能量/信道/数据/公平性权重；
+   - `scheduler.selection_top_k`：覆盖调度 Top‑K 参数；
+   - `fedbuff.staleness_alpha`：覆盖异步陈旧度加权参数；
+5. 最终，用户可以直接使用这个 best 配置重新运行 Flower 仿真，即完成“经 GA 优化后的联邦训练部署”。
 
 ---
 
-## 7. 总结：从“教学级 Demo”升级到“论文级原型”
+## 7. 总结
 
 通过上述模块，本工程已经实现了：
 
 - 模型侧：从小 CNN 升级到 CIFAR‑10 / EMNIST 上的 ResNet‑18 变体（支持宽度缩放），在 quick 配置下使用“窄版 ResNet”，在完整配置下使用标准宽度；
 - 训练侧：在 FedAvg 基础上，引入严格遵循论文定义的 FedProx 与控制变元版本的 SCAFFOLD；
-- 聚合侧：实现了半同步、FedBuff 异步和桥接态混合聚合，并用门控 + 迟滞实现动态切换；
+- 聚合侧：基于 Flower 框架实现了半同步、FedBuff 异步和桥接态混合聚合，并用门控 + 迟滞实现动态切换；
 - 无线侧：引入基于路径损耗 + 阴影 + Rayleigh 衰落的统计信道模型，近似 DeepMIMO / NYUSIM / QuaDRiGa / 3GPP TR 38.901；
-- 优化侧：实现了 NSGA‑III + MOEA/D + 岛屿模型 + 局部搜索 + 多保真评估的 MOGA‑FL，用于自动搜索调度与异步相关参数。
+- 优化侧：实现了 NSGA‑III + MOEA/D + 岛屿模型 + 局部搜索 + 多保真评估的 MOGA‑FL，用于自动搜索调度与异步相关参数。新增了对 `pymoo` 库的支持以增强优化鲁棒性。
 
 这些实现都在代码层面给出了清晰注释，明确指出“对应论文中的哪一部分思想”，便于在毕设论文和答辩中直接引用和讲解。用户可以围绕门控切换、半同步/异步聚合、遗传算法搜索与无线建模这四条主线，系统回答“我具体实现了什么复杂方法”。
+
+--
+
+## TODO
+
+### FL
+Experiments
+
+### GA
+1. 构造低保真与高保真评估器 `low_sim` / `high_sim`：
+   - `low_sim`：缩短轮数、减少客户端数，用于快速粗评估；
+   - `high_sim`：使用原配置的轮数和客户端数，对少数精英解高保真评估；
+2. 考虑把 `hysteresis`（选择防抖的迟滞系数）划入参数搜索范围

@@ -1,173 +1,132 @@
+from __future__ import annotations
+
 import argparse
+import copy
 import os
-import numpy as np
-import torch
+from typing import Any, Dict, List
+
 import pandas as pd
-from src.configs.config import load_config, merge_defaults
-from src.utils.seed import set_seed
-from src.data.dataset_loader import DatasetManager
-from src.data.partition import dirichlet_partition, label_bias_partition, quantity_bias_partition, apply_quick_limit
-from src.training.models.cifar_cnn import SimpleCIFARCNN
-from src.training.models.emnist_cnn import SimpleEMNISTCNN
-from src.training.server import Server
-from src.ga.nsga3 import NSGA3
-from src.ga.moead import MOEAD
+import yaml
+
+from src.configs.strategy_runtime import default_strategy_yaml, load_strategy_yaml
 from src.ga.moga_fl import MOGAFLController
+from src.ga.moead import MOEAD
+from src.ga.nsga3 import NSGA3
+from src.ga.sim_runner_flower import make_flower_sim_runner
 
 
-def build_partitions(train_dataset, cfg, num_classes):
-    labels = np.array([y for _, y in train_dataset])
-    num_clients = cfg['clients']['num_clients']
-    niid = cfg['dataset']['noniid']
-    if niid['type'] == 'dirichlet':
-        client_indices = dirichlet_partition(labels, num_clients, num_classes, niid.get('alpha',0.5))
-    elif niid['type'] == 'label_bias':
-        cpc = niid.get('classes_per_client', niid.get('label_bias_classes_per_client',2))
-        client_indices = label_bias_partition(labels, num_clients, num_classes, cpc)
-    else:
-        client_indices = quantity_bias_partition(labels, num_clients, niid.get('quantity_bias_sigma',0.6))
-    spc = cfg['clients'].get('samples_per_client')
-    if spc:
-        client_indices = apply_quick_limit(client_indices, spc)
-    return client_indices
+def _select_best(pop: List[Dict[str, Any]], metrics: List[Dict[str, float]], preference: str) -> int:
+    """根据偏好从候选解中选出一个“部署用”解。"""
+    if not pop or not metrics:
+        return 0
+    pref = str(preference or "time").lower()
+    best_idx = 0
+    best_score: float | None = None
+    for i, m in enumerate(metrics):
+        acc = float(m.get("acc", 0.0))
+        time = float(m.get("time", 0.0))
+        fairness = float(m.get("fairness", 0.0))
+        energy = float(m.get("energy", 0.0))
+        if pref == "fairness":
+            score = fairness + 0.05 * acc
+        elif pref == "energy":
+            score = -energy + 0.1 * acc
+        else:  # time 优先
+            score = -time + 0.1 * acc
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
 
 
-def make_sim_runner(cfg, train, test, num_classes, partitions, device, round_scale: float = 0.6):
-    """构造一个用于 GA 评估的联邦训练短跑器。
-
-    round_scale 用于控制评估轮数比例：
-    - 低保真评估：如 0.4 / 0.6，只跑少量轮数；
-    - 高保真评估：如 1.0，跑满配置中的轮数。
-    """
-    def runner(params):
-        # apply params into cfg copy
-        cfg2 = {**cfg}
-        # scheduling weights
-        cfg2['scheduling'] = cfg['scheduling'].copy()
-        cfg2['scheduling']['weights'] = {
-            'energy': params['energy_w'],
-            'channel': params['channel_w'],
-            'data_value': params['data_w'],
-            'fairness_debt': params['fair_w'],
-            'bandwidth_cost': params['bwcost_w'],
-        }
-        cfg2['clients'] = cfg['clients'].copy()
-        cfg2['clients']['selection_top_k'] = int(params['selection_top_k'])
-        cfg2['clients']['hysteresis'] = float(params['hysteresis'])
-        cfg2['training'] = cfg['training'].copy()
-        cfg2['training']['fedbuff'] = cfg['training'].get('fedbuff', {}).copy()
-        cfg2['training']['fedbuff']['staleness_alpha'] = float(params['staleness_alpha'])
-        # short / full eval rounds
-        cfg2['eval'] = cfg['eval'].copy()
-        cfg2['eval']['rounds'] = max(3, int(cfg['eval']['rounds'] * round_scale))
-        server = Server(
-            SimpleCIFARCNN if cfg['dataset']['name'] == 'cifar10' else (lambda: SimpleEMNISTCNN(num_classes)),
-            train,
-            test,
-            num_classes,
-            cfg2,
-            device,
-        )
-        server.init_clients(
-            partitions,
-            SimpleCIFARCNN if cfg['dataset']['name'] == 'cifar10' else (lambda: SimpleEMNISTCNN(num_classes)),
-        )
-        accs = []
-        times = []
-        fairs = []
-        energies = []
-        for r in range(cfg2['eval']['rounds']):
-            row = server.round(r, partitions)
-            accs.append(row['accuracy'])
-            times.append(row['comm_time'])
-            fairs.append(row['jain_index'])
-            energies.append(row['comm_energy'] + row['comp_energy'])
-        return {
-            'acc': float(np.mean(accs)),
-            'time': float(np.mean(times)),
-            'fairness': float(np.mean(fairs)),
-            'energy': float(np.mean(energies)),
-        }
-
-    return runner
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--generations', type=int, default=6)
-    parser.add_argument('--pop', type=int, default=16)
-    parser.add_argument('--algo', type=str, default='nsga3', choices=['nsga3', 'moead', 'moga_fl'])
+def main() -> None:
+    parser = argparse.ArgumentParser(description="GA optimization for hybrid wireless FL (Flower)")
+    parser.add_argument("--config", type=str, default="", help="策略 YAML 路径，默认使用 src/configs/strategies/<strategy>.yaml")
+    parser.add_argument("--strategy", type=str, default="hybrid_opt", help="策略名称，对应 YAML 与 Flower strategy factory")
+    parser.add_argument("--generations", type=int, default=6, help="GA 迭代代数")
+    parser.add_argument("--pop", type=int, default=16, help="种群大小")
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default="nsga3",
+        choices=["nsga3", "moead", "moga_fl", "pymoo_nsga3"],
+        help="选择使用的多目标优化算法",
+    )
+    parser.add_argument("--num-rounds", type=int, default=None, help="可选：覆盖 YAML 中 fl.num_rounds 以加速验证")
     args = parser.parse_args()
-    cfg = merge_defaults(load_config(args.config))
-    set_seed(cfg['eval']['seed'])
-    dm = DatasetManager(cfg)
-    train, test, num_classes = dm.load()
-    partitions = build_partitions(train, cfg, num_classes)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 低保真与高保真评估器：用于多保真 GA
-    low_sim = make_sim_runner(cfg, train, test, num_classes, partitions, device, round_scale=0.5)
-    high_sim = make_sim_runner(cfg, train, test, num_classes, partitions, device, round_scale=1.0)
 
-    if args.algo == 'nsga3':
+    config_path = args.config.strip() or default_strategy_yaml(args.strategy)
+    cfg = load_strategy_yaml(config_path)
+    cfg = dict(cfg)
+    cfg["strategy_name"] = args.strategy
+    if args.num_rounds is not None:
+        fl = cfg.get("fl", {}) if isinstance(cfg.get("fl", {}), dict) else {}
+        fl["num_rounds"] = int(args.num_rounds)
+        cfg["fl"] = fl
+
+    # 低保真与高保真评估器：均基于 Flower HybridWirelessStrategy
+    low_sim = make_flower_sim_runner(cfg, strategy_name=args.strategy, round_scale=0.5)
+    high_sim = make_flower_sim_runner(cfg, strategy_name=args.strategy, round_scale=1.0)
+
+    if args.algo == "nsga3":
         opt = NSGA3(cfg, low_sim, pop_size=args.pop)
         pop, metrics = opt.run(generations=args.generations)
-    elif args.algo == 'moead':
-        opt = MOEAD(low_sim, pop_size=args.pop)
+    elif args.algo == "moead":
+        opt = MOEAD(cfg, low_sim, pop_size=args.pop)
         pop, metrics = opt.run(generations=args.generations)
-    else:
-        # 统一的 MOGA-FL 控制器：内部组合 NSGA-III + MOEA/D + 岛屿 + 局部搜索
-        opt = MOGAFLController(cfg, low_fidelity_eval=low_sim, high_fidelity_eval=high_sim, pop_size=args.pop)
-        pop, metrics = opt.run(generations=args.generations)
+    elif args.algo == "moga_fl":
+        controller = MOGAFLController(cfg, low_fidelity_eval=low_sim, high_fidelity_eval=high_sim, pop_size=args.pop)
+        pop, metrics = controller.run(generations=args.generations)
+    else:  # pymoo_nsga3
+        from src.ga.pymoo_nsga3 import run_pymoo_nsga3
 
-    os.makedirs('outputs/results', exist_ok=True)
-    rows = []
+        pop, metrics = run_pymoo_nsga3(
+            cfg,
+            strategy_name=args.strategy,
+            round_scale=0.5,
+            pop_size=args.pop,
+            generations=args.generations,
+        )
+
+    os.makedirs("outputs/results", exist_ok=True)
+    rows: List[Dict[str, Any]] = []
     for p, m in zip(pop, metrics):
         row = {**p, **m}
         rows.append(row)
     df = pd.DataFrame(rows)
-    df.to_csv('outputs/results/pareto_candidates.csv', index=False)
-    print('Saved Pareto candidates to outputs/results/pareto_candidates.csv')
+    pareto_path = "outputs/results/pareto_candidates.csv"
+    df.to_csv(pareto_path, index=False)
+    print(f"Saved Pareto candidates to {pareto_path}")
 
-    # 从 Pareto 候选中，根据偏好选择一个“部署用”解，并导出配置
-    preference = cfg['eval'].get('preference', 'time')  # time / fairness / energy
-    best_idx = 0
-    best_score = None
-    for i, m in enumerate(metrics):
-        if preference == 'time':
-            score = -m['time'] + 0.1 * m['acc']
-        elif preference == 'fairness':
-            score = m['fairness'] + 0.05 * m['acc']
-        else:  # energy 优先
-            score = -m['energy'] + 0.1 * m['acc']
-        if best_score is None or score > best_score:
-            best_score = score
-            best_idx = i
+    # 根据简单偏好规则选出一个“部署用”解，并导出新的策略 YAML。
+    eval_cfg = cfg.get("eval", {}) if isinstance(cfg.get("eval", {}), dict) else {}
+    preference = str(eval_cfg.get("preference", "time"))
+    best_idx = _select_best(pop, metrics, preference)
 
-    best_params = pop[best_idx]
-    deploy_cfg = cfg.copy()
-    deploy_cfg.setdefault('scheduling', {})
-    deploy_cfg['scheduling']['weights'] = {
-        'energy': best_params['energy_w'],
-        'channel': best_params['channel_w'],
-        'data_value': best_params['data_w'],
-        'fairness_debt': best_params['fair_w'],
-        'bandwidth_cost': best_params['bwcost_w'],
-    }
-    deploy_cfg.setdefault('clients', cfg['clients'].copy())
-    deploy_cfg['clients']['selection_top_k'] = int(best_params['selection_top_k'])
-    deploy_cfg['clients']['hysteresis'] = float(best_params['hysteresis'])
-    deploy_cfg.setdefault('training', cfg['training'].copy())
-    fb_cfg = deploy_cfg['training'].get('fedbuff', cfg['training'].get('fedbuff', {}).copy())
-    fb_cfg['staleness_alpha'] = float(best_params['staleness_alpha'])
-    deploy_cfg['training']['fedbuff'] = fb_cfg
+    best_params = pop[best_idx] if pop else {}
+    deploy_cfg: Dict[str, Any] = copy.deepcopy(cfg)
 
-    best_cfg_path = 'outputs/results/best_moga_fl_config.yaml'
-    with open(best_cfg_path, 'w') as f:
-        import yaml
+    scheduler = deploy_cfg.get("scheduler", {}) if isinstance(deploy_cfg.get("scheduler", {}), dict) else {}
+    weights = scheduler.get("weights", {}) if isinstance(scheduler.get("weights", {}), dict) else {}
+    weights["energy_w"] = float(best_params.get("energy_w", weights.get("energy_w", 0.15)))
+    weights["channel_w"] = float(best_params.get("channel_w", weights.get("channel_w", 0.25)))
+    weights["data_w"] = float(best_params.get("data_w", weights.get("data_w", 0.25)))
+    weights["fair_w"] = float(best_params.get("fair_w", weights.get("fair_w", 0.25)))
+    scheduler["weights"] = weights
+    if "selection_top_k" in best_params:
+        scheduler["selection_top_k"] = int(best_params["selection_top_k"])
+    deploy_cfg["scheduler"] = scheduler
 
+    fedbuff = deploy_cfg.get("fedbuff", {}) if isinstance(deploy_cfg.get("fedbuff", {}), dict) else {}
+    if "staleness_alpha" in best_params:
+        fedbuff["staleness_alpha"] = float(best_params["staleness_alpha"])
+    deploy_cfg["fedbuff"] = fedbuff
+
+    best_cfg_path = "outputs/results/best_moga_fl_config.yaml"
+    with open(best_cfg_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(deploy_cfg, f, sort_keys=False, allow_unicode=True)
     print(f"Saved best deployment config to {best_cfg_path}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
