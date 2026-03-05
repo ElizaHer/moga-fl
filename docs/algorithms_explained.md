@@ -432,3 +432,47 @@ Experiments
    - `low_sim`：缩短轮数、减少客户端数，用于快速粗评估；
    - `high_sim`：使用原配置的轮数和客户端数，对少数精英解高保真评估；
 2. 考虑把 `hysteresis`（选择防抖的迟滞系数）划入参数搜索范围
+
+## 8. Hybrid Client-Scoring Upgrade (2026-03-05)
+This section documents the planned upgrade to improve `hybrid_invTrue` under jitter.
+
+### 8.1 Composite quality score
+For each active client i, define:
+
+`quality_i = a*(1-PER_i) + b*data_value_i + c*historical_contribution_i`
+
+`survival_i = clip(remaining_energy_i / expected_round_energy_i, 0, 1)`
+
+`score_i = quality_i * survival_i^gamma + fair_w*fairness_debt_i`
+
+where:
+- `data_value_i` captures client-side data utility,
+- `historical_contribution_i` is a smoothed estimate of effectiveness per cost,
+- `gamma` controls how strongly low-energy clients are downweighted.
+
+### 8.2 data_value definition (lightweight online version)
+`data_value_i = novelty_w*novelty_i + tail_w*tail_i + size_w*size_i`
+
+Current implementation approximation:
+- `size_i`: normalized partition size.
+- `tail_i`: inverse historical selection frequency (clients rarely selected are boosted).
+- `novelty_i`: one-step loss-improvement proxy from per-client contribution history.
+
+### 8.3 historical_contribution definition
+Maintain EMA per client:
+`hist_contrib_i <- beta*hist_contrib_i + (1-beta)*(delta_acc_i / max(cost_i, eps))`
+
+Practical approximation in simulation:
+- `delta_acc_i` uses round-level relative contribution proxy.
+- `cost_i` uses communication + compute energy estimate.
+
+### 8.4 Energy guardrails and anti-monopoly
+- Reserve threshold: if `remaining_energy_i / initial_energy_i < min_reserve_energy_ratio`, skip client.
+- Future-feasibility gate: if `remaining_energy_i < k * expected_round_energy_i`, skip client.
+- Anti-monopoly: enforce `max_consecutive_selected` and `cooldown_rounds`.
+
+### 8.5 Bridge invariant tuning direction
+When bridge invariants hurt performance:
+- raise budgets and thresholds,
+- reduce downweight and throttle intensity,
+- keep smooth switching while avoiding over-throttling useful updates.

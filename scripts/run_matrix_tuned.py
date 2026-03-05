@@ -30,7 +30,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-rounds", type=int, default=60)
     p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--algorithm", default="fedprox")
-    p.add_argument("--fedprox-mu", type=float, default=0.05)
+    p.add_argument("--fedprox-mu", type=float, default=0.01)
+    p.add_argument("--wsn-lr", type=float, default=0.0005)
+    p.add_argument("--wsn-fedprox-mu", type=float, default=0.01)
+    p.add_argument("--jitter-lr", type=float, default=0.0005)
+    p.add_argument("--jitter-fedprox-mu", type=float, default=0.05)
+    p.add_argument("--jitter-start-state", default="bad", choices=["good", "bad"])
+    p.add_argument("--jitter-period-rounds", type=int, default=20)
+    p.add_argument("--jitter-profile", default="p2_balanced_bridge", choices=["none", "p1_async_sensitive_relaxed_inv", "p2_balanced_bridge", "p3_stability_fairness"])
+    p.add_argument("--initial-client-energy", type=float, default=2000.0)
+    p.add_argument("--client-initial-energies", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--job-timeout-sec", type=int, default=0)
@@ -110,33 +119,100 @@ def parse_metrics_path(log_path: Path) -> Optional[Path]:
     return None
 
 
-def build_configs(config_dir: Path) -> Dict[str, Path]:
+def apply_jitter_profile(cfg: Dict, profile: str) -> Dict:
+    if profile == "none":
+        return cfg
+    c = cfg
+    c.setdefault("controller", {})
+    c["controller"].setdefault("gate_thresholds", {})
+    c["controller"].setdefault("gate_weights", {})
+    c["controller"].setdefault("bridge_invariants", {})
+    c.setdefault("fedbuff", {})
+    if profile == "p1_async_sensitive_relaxed_inv":
+        c["controller"]["semi_sync_wait_ratio"] = 0.72
+        c["controller"]["gate_thresholds"]["to_async"] = 0.54
+        c["controller"]["gate_thresholds"]["to_semi_sync"] = 0.44
+        c["controller"]["hysteresis_margin"] = 0.02
+        c["controller"]["bridge_rounds"] = 2
+        c["controller"]["min_rounds_between_switch"] = 2
+        c["controller"]["gate_weights"]["per"] = 0.65
+        c["controller"]["gate_weights"]["fairness"] = 0.20
+        c["controller"]["gate_weights"]["energy"] = 0.15
+        c["controller"]["bridge_invariants"]["energy_budget_round"] = 160.0
+        c["controller"]["bridge_invariants"]["upload_time_budget_round"] = 3.2
+        c["controller"]["bridge_invariants"]["thresholds"] = {"th1": 0.18, "th2": 0.35, "th3": 0.55}
+        c["controller"]["bridge_invariants"]["downweight_factor"] = 0.7
+        c["controller"]["bridge_invariants"]["rate_limit_factor"] = 0.9
+        c["fedbuff"]["buffer_size"] = 10
+        c["fedbuff"]["min_updates_to_aggregate"] = 4
+        c["fedbuff"]["staleness_alpha"] = 1.2
+        c["fedbuff"]["max_staleness"] = 8
+    elif profile == "p2_balanced_bridge":
+        c["controller"]["semi_sync_wait_ratio"] = 0.78
+        c["controller"]["gate_thresholds"]["to_async"] = 0.58
+        c["controller"]["gate_thresholds"]["to_semi_sync"] = 0.42
+        c["controller"]["hysteresis_margin"] = 0.03
+        c["controller"]["bridge_rounds"] = 4
+        c["controller"]["min_rounds_between_switch"] = 4
+        c["controller"]["gate_weights"]["per"] = 0.55
+        c["controller"]["gate_weights"]["fairness"] = 0.25
+        c["controller"]["gate_weights"]["energy"] = 0.20
+        c["controller"]["bridge_invariants"]["energy_budget_round"] = 130.0
+        c["controller"]["bridge_invariants"]["upload_time_budget_round"] = 2.6
+        c["controller"]["bridge_invariants"]["thresholds"] = {"th1": 0.12, "th2": 0.28, "th3": 0.48}
+        c["controller"]["bridge_invariants"]["downweight_factor"] = 0.55
+        c["controller"]["bridge_invariants"]["rate_limit_factor"] = 0.85
+        c["fedbuff"]["buffer_size"] = 8
+        c["fedbuff"]["min_updates_to_aggregate"] = 4
+        c["fedbuff"]["staleness_alpha"] = 1.0
+        c["fedbuff"]["max_staleness"] = 7
+    elif profile == "p3_stability_fairness":
+        c["controller"]["semi_sync_wait_ratio"] = 0.85
+        c["controller"]["gate_thresholds"]["to_async"] = 0.63
+        c["controller"]["gate_thresholds"]["to_semi_sync"] = 0.39
+        c["controller"]["hysteresis_margin"] = 0.05
+        c["controller"]["bridge_rounds"] = 5
+        c["controller"]["min_rounds_between_switch"] = 5
+        c["controller"]["gate_weights"]["per"] = 0.45
+        c["controller"]["gate_weights"]["fairness"] = 0.35
+        c["controller"]["gate_weights"]["energy"] = 0.20
+        c["controller"]["bridge_invariants"]["energy_budget_round"] = 120.0
+        c["controller"]["bridge_invariants"]["upload_time_budget_round"] = 2.5
+        c["controller"]["bridge_invariants"]["thresholds"] = {"th1": 0.10, "th2": 0.25, "th3": 0.45}
+        c["controller"]["bridge_invariants"]["downweight_factor"] = 0.5
+        c["controller"]["bridge_invariants"]["rate_limit_factor"] = 0.8
+        c["fedbuff"]["buffer_size"] = 12
+        c["fedbuff"]["min_updates_to_aggregate"] = 5
+        c["fedbuff"]["staleness_alpha"] = 1.4
+        c["fedbuff"]["max_staleness"] = 6
+    return c
+
+
+def build_configs(
+    config_dir: Path,
+    wsn_lr: float,
+    wsn_mu: float,
+    jitter_start_state: str,
+    jitter_period_rounds: int,
+    jitter_profile: str,
+    initial_client_energy: float,
+    client_initial_energies: str,
+) -> Dict[str, Path]:
     config_dir.mkdir(parents=True, exist_ok=True)
     base = read_yaml(Path("src/configs/strategies/hybrid_opt.yaml"))
 
-    # Bundle A2: async-sensitive switching + shorter bridge + fresher FedBuff + harder jitter channel
-    base.setdefault("fl", {})["local_epochs"] = 2
-    base["fl"]["lr"] = 0.0005
-    base.setdefault("algorithm", {})["fedprox_mu"] = 0.1
-    base.setdefault("controller", {})["semi_sync_wait_ratio"] = 0.75
-    base["controller"].setdefault("gate_thresholds", {})["to_async"] = 0.55
-    base["controller"]["gate_thresholds"]["to_semi_sync"] = 0.45
-    base["controller"]["hysteresis_margin"] = 0.02
-    base["controller"]["bridge_rounds"] = 2
-    base["controller"]["min_rounds_between_switch"] = 2
-    base.setdefault("fedbuff", {})["buffer_size"] = 6
-    base["fedbuff"]["min_updates_to_aggregate"] = 3
-    base["fedbuff"]["async_agg_interval"] = 1
-    base["fedbuff"]["staleness_alpha"] = 1.0
-    base["fedbuff"]["max_staleness"] = 8
-    base.setdefault("wireless", {})["base_snr_db"] = 6.0
-    base["wireless"]["per_k"] = 0.8
-    base["wireless"]["block_fading_intensity"] = 1.4
-    base["wireless"]["bandwidth_budget_mb_per_round"] = 8.0
-    base.setdefault("scheduler", {}).setdefault("weights", {})["channel_w"] = 0.45
-    base["scheduler"]["weights"]["data_w"] = 0.30
-    base["scheduler"]["weights"]["fair_w"] = 0.20
-    base["scheduler"]["weights"]["energy_w"] = 0.05
+    # Baseline config updates from pretest:
+    # best for wsn+hybrid+inv_true pretest: lr=0.0005, fedprox_mu=0.01
+    base.setdefault("fl", {})["local_epochs"] = 1
+    base["fl"]["lr"] = float(wsn_lr)
+    base.setdefault("algorithm", {})["fedprox_mu"] = float(wsn_mu)
+    base.setdefault("fedbuff", {})["async_agg_interval"] = 2
+    base.setdefault("wireless", {})["jitter_start_state"] = str(jitter_start_state)
+    base["wireless"]["jitter_period_rounds"] = int(jitter_period_rounds)
+    base = apply_jitter_profile(base, jitter_profile)
+    base.setdefault("energy", {})["initial_client_energy"] = float(initial_client_energy)
+    if client_initial_energies.strip():
+        base["energy"]["client_initial_energies"] = [float(x.strip()) for x in client_initial_energies.split(",") if x.strip()]
 
     inv_true = config_dir / "hybrid_opt_inv_true.yaml"
     inv_false = config_dir / "hybrid_opt_inv_false.yaml"
@@ -187,12 +263,14 @@ def run_attempt(
         "--alpha",
         str(args.alpha),
         "--algorithm",
-        args.algorithm,
+        job["algorithm"],
         "--seed",
         str(args.seed),
+        "--lr",
+        str(job["lr"]),
     ]
-    if args.algorithm == "fedprox":
-        cmd.extend(["--fedprox-mu", str(args.fedprox_mu)])
+    if job["algorithm"] == "fedprox":
+        cmd.extend(["--fedprox-mu", str(job["fedprox_mu"])])
     if job["simulated_mode"]:
         cmd.extend(["--simulated-mode", job["simulated_mode"]])
 
@@ -201,7 +279,7 @@ def run_attempt(
         name=tag,
         content=(
             f"tag={tag} strategy={job['strategy']} wm={job['wireless_model']} sm={job['simulated_mode']} "
-            f"alpha={args.alpha} algo={args.algorithm} mu={args.fedprox_mu} seed={args.seed} rounds={args.num_rounds}"
+            f"alpha={args.alpha} algo={job['algorithm']} lr={job['lr']} mu={job['fedprox_mu']} seed={args.seed} rounds={args.num_rounds}"
         ),
         enabled=send_wechat_enabled,
     )
@@ -274,21 +352,29 @@ def run_attempt(
     return {"status": status, "copied_csv": copied_csv}
 
 
-def build_jobs(inv_true_cfg: Path, inv_false_cfg: Path, max_attempts: int) -> List[Dict[str, str]]:
+def build_jobs(
+    inv_true_cfg: Path,
+    inv_false_cfg: Path,
+    max_attempts: int,
+    wsn_lr: float,
+    wsn_mu: float,
+    jitter_lr: float,
+    jitter_mu: float,
+) -> List[Dict[str, str]]:
     # TODO text says total 11 jobs while the explicit list is 10.
     # Added hybrid_wsn_invFalse as a disambiguation run to keep the required 11 count.
     jobs = [
-        {"tag": "hybrid_wsn_invTrue", "strategy": "hybrid_opt", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "bandwidth_first_wsn_invTrue", "strategy": "bandwidth_first", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "energy_first_wsn_invTrue", "strategy": "energy_first", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "hybrid_jitter_invFalse", "strategy": "hybrid_opt", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_false_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "hybrid_jitter_invTrue", "strategy": "hybrid_opt", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "sync_jitter_invTrue", "strategy": "sync", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "async_jitter_invTrue", "strategy": "async", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "bridge_free_jitter_invTrue", "strategy": "bridge_free", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "bandwidth_first_jitter_invTrue", "strategy": "bandwidth_first", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "energy_first_jitter_invTrue", "strategy": "energy_first", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "max_attempts": str(max_attempts)},
-        {"tag": "hybrid_wsn_invFalse", "strategy": "hybrid_opt", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_false_cfg), "max_attempts": str(max_attempts)},
+        {"tag": "hybrid_wsn_invTrue", "strategy": "hybrid_opt", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "algorithm": "fedprox", "lr": str(wsn_lr), "fedprox_mu": str(wsn_mu), "max_attempts": str(max_attempts)},
+        {"tag": "bandwidth_first_wsn_invTrue", "strategy": "bandwidth_first", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "algorithm": "fedavg", "lr": str(wsn_lr), "fedprox_mu": "0.0", "max_attempts": str(max_attempts)},
+        {"tag": "energy_first_wsn_invTrue", "strategy": "energy_first", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_true_cfg), "algorithm": "fedavg", "lr": str(wsn_lr), "fedprox_mu": "0.0", "max_attempts": str(max_attempts)},
+        {"tag": "hybrid_jitter_invFalse", "strategy": "hybrid_opt", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_false_cfg), "algorithm": "fedprox", "lr": str(jitter_lr), "fedprox_mu": str(jitter_mu), "max_attempts": str(max_attempts)},
+        {"tag": "hybrid_jitter_invTrue", "strategy": "hybrid_opt", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedprox", "lr": str(jitter_lr), "fedprox_mu": str(jitter_mu), "max_attempts": str(max_attempts)},
+        {"tag": "sync_jitter_invTrue", "strategy": "sync", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedprox", "lr": str(jitter_lr), "fedprox_mu": str(jitter_mu), "max_attempts": str(max_attempts)},
+        {"tag": "async_jitter_invTrue", "strategy": "async", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedprox", "lr": str(jitter_lr), "fedprox_mu": str(jitter_mu), "max_attempts": str(max_attempts)},
+        {"tag": "bridge_free_jitter_invTrue", "strategy": "bridge_free", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedprox", "lr": str(jitter_lr), "fedprox_mu": str(jitter_mu), "max_attempts": str(max_attempts)},
+        {"tag": "bandwidth_first_jitter_invTrue", "strategy": "bandwidth_first", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedavg", "lr": str(jitter_lr), "fedprox_mu": "0.0", "max_attempts": str(max_attempts)},
+        {"tag": "energy_first_jitter_invTrue", "strategy": "energy_first", "wireless_model": "simulated", "simulated_mode": "jitter", "config": str(inv_true_cfg), "algorithm": "fedavg", "lr": str(jitter_lr), "fedprox_mu": "0.0", "max_attempts": str(max_attempts)},
+        {"tag": "hybrid_wsn_invFalse", "strategy": "hybrid_opt", "wireless_model": "wsn", "simulated_mode": "", "config": str(inv_false_cfg), "algorithm": "fedprox", "lr": str(wsn_lr), "fedprox_mu": str(wsn_mu), "max_attempts": str(max_attempts)},
     ]
     return jobs
 
@@ -317,8 +403,25 @@ def main() -> None:
     matrix_dir.mkdir(parents=True, exist_ok=True)
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    cfgs = build_configs(config_dir)
-    jobs = build_jobs(cfgs["inv_true"], cfgs["inv_false"], args.max_attempts)
+    cfgs = build_configs(
+        config_dir,
+        args.wsn_lr,
+        args.wsn_fedprox_mu,
+        args.jitter_start_state,
+        args.jitter_period_rounds,
+        args.jitter_profile,
+        args.initial_client_energy,
+        args.client_initial_energies,
+    )
+    jobs = build_jobs(
+        cfgs["inv_true"],
+        cfgs["inv_false"],
+        args.max_attempts,
+        args.wsn_lr,
+        args.wsn_fedprox_mu,
+        args.jitter_lr,
+        args.jitter_fedprox_mu,
+    )
     if len(jobs) != 11:
         raise RuntimeError(f"matrix job size mismatch: {len(jobs)}")
 
@@ -359,7 +462,7 @@ def main() -> None:
             print(f"[FAIL] retries exhausted: {tag}")
             continue
 
-        row = [tag, job["strategy"], job["wireless_model"], job["simulated_mode"], str(args.alpha), args.algorithm, str(args.seed), str(args.fedprox_mu), copied_csv]
+        row = [tag, job["strategy"], job["wireless_model"], job["simulated_mode"], str(args.alpha), job["algorithm"], str(args.seed), str(job["fedprox_mu"]), copied_csv]
         append_csv(manifest_path, row)
         append_csv(legacy_manifest_path, row)
 

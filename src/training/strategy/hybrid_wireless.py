@@ -55,6 +55,30 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.fraction_fit = float(fl_cfg.get("fraction_fit", 0.5))
         self.selection_top_k = int(scheduler_cfg.get("selection_top_k", 0))
         self.fair_window_size = int(scheduler_cfg.get("fair_window_size", 4))
+        self.data_value_weights = (
+            scheduler_cfg.get("data_value_weights", {})
+            if isinstance(scheduler_cfg.get("data_value_weights", {}), dict)
+            else {}
+        )
+        self.novelty_w = float(self.data_value_weights.get("novelty_w", 0.2))
+        self.tail_w = float(self.data_value_weights.get("tail_w", 0.4))
+        self.size_w = float(self.data_value_weights.get("size_w", 0.4))
+        self.contribution_ema_beta = float(scheduler_cfg.get("contribution_ema_beta", 0.9))
+        self.energy_guard_cfg = (
+            scheduler_cfg.get("energy_guard", {})
+            if isinstance(scheduler_cfg.get("energy_guard", {}), dict)
+            else {}
+        )
+        self.min_reserve_energy_ratio = float(self.energy_guard_cfg.get("min_reserve_energy_ratio", 0.1))
+        self.future_energy_factor = float(self.energy_guard_cfg.get("future_energy_factor", 1.2))
+        self.survival_gamma = float(self.energy_guard_cfg.get("survival_gamma", 1.5))
+        self.selection_guard_cfg = (
+            scheduler_cfg.get("selection_guard", {})
+            if isinstance(scheduler_cfg.get("selection_guard", {}), dict)
+            else {}
+        )
+        self.max_consecutive_selected = int(self.selection_guard_cfg.get("max_consecutive_selected", 3))
+        self.cooldown_rounds = int(self.selection_guard_cfg.get("cooldown_rounds", 2))
         self.algorithm = str(algorithm_cfg.get("name", "fedavg")).lower()
         self.strategy_name = str(cfg.get("strategy_name", "hybrid_opt")).lower()
         self.fedprox_mu = float(algorithm_cfg.get("fedprox_mu", 0.0))
@@ -113,6 +137,10 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.client_energy: Dict[int, float] = {}
         self.exhausted_clients: set[int] = set()
         self._init_client_energy()
+        self.client_contribution_ema: Dict[int, float] = {cid: 0.0 for cid in range(self.num_clients)}
+        self.client_selection_streak: Dict[int, int] = {cid: 0 for cid in range(self.num_clients)}
+        self.client_cooldown_until: Dict[int, int] = {cid: 0 for cid in range(self.num_clients)}
+        self.prev_round_accuracy: float = 0.0
 
         self._base_bandwidth_budget = float(self.bw.budget_mb)
 
@@ -209,6 +237,59 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
 
     def _update_bandwidth_budget(self) -> None:
         self.bw.budget_mb = self._base_bandwidth_budget * float(self.current_bw_factor)
+
+    def _can_select_by_cooldown(self, cid: int, server_round: int) -> bool:
+        return int(self.client_cooldown_until.get(cid, 0)) < int(server_round)
+
+    def _is_client_eligible_energy(self, cid: int, expected_round_energy: float) -> bool:
+        rem = float(self.client_energy.get(cid, 0.0))
+        if rem <= 0.0:
+            return False
+        init_e = float(self.initial_client_energy) if self.initial_client_energy > 0.0 else 1.0
+        if rem / init_e < self.min_reserve_energy_ratio:
+            return False
+        if rem < self.future_energy_factor * max(expected_round_energy, 1e-12):
+            return False
+        return True
+
+    def _compute_data_value_scores(self, active_cids: List[int], data_norm: np.ndarray) -> np.ndarray:
+        out = np.zeros(self.num_clients, dtype=np.float64)
+        counts = self._compute_selection_counts()
+        max_count = float(counts.max()) if counts.size > 0 else 0.0
+        rarity = np.ones(self.num_clients, dtype=np.float64)
+        if max_count > 0.0:
+            rarity = 1.0 - counts / max_count
+        contrib = np.asarray([float(self.client_contribution_ema.get(cid, 0.0)) for cid in range(self.num_clients)], dtype=np.float64)
+        cmin, cmax = float(contrib.min()), float(contrib.max())
+        novelty = np.zeros(self.num_clients, dtype=np.float64)
+        if cmax > cmin:
+            novelty = (contrib - cmin) / (cmax - cmin)
+        for cid in active_cids:
+            out[cid] = self.novelty_w * novelty[cid] + self.tail_w * rarity[cid] + self.size_w * data_norm[cid]
+        return out
+
+    def _compute_historical_contribution_scores(self, active_cids: List[int]) -> np.ndarray:
+        out = np.zeros(self.num_clients, dtype=np.float64)
+        vals = np.asarray([float(self.client_contribution_ema.get(cid, 0.0)) for cid in range(self.num_clients)], dtype=np.float64)
+        vmin, vmax = float(vals.min()), float(vals.max())
+        if vmax > vmin:
+            vals = (vals - vmin) / (vmax - vmin)
+        else:
+            vals = np.zeros_like(vals)
+        for cid in active_cids:
+            out[cid] = vals[cid]
+        return out
+
+    def _update_selection_streaks(self, selected_cids: List[int], server_round: int) -> None:
+        selected = set(selected_cids)
+        for cid in range(self.num_clients):
+            if cid in selected:
+                self.client_selection_streak[cid] = int(self.client_selection_streak.get(cid, 0)) + 1
+                if self.max_consecutive_selected > 0 and self.client_selection_streak[cid] >= self.max_consecutive_selected:
+                    self.client_cooldown_until[cid] = int(server_round) + int(max(1, self.cooldown_rounds))
+                    self.client_selection_streak[cid] = 0
+            else:
+                self.client_selection_streak[cid] = 0
 
     def _weighted_avg(self, pairs: List[Tuple[List[np.ndarray], float]], fallback: List[np.ndarray]) -> List[np.ndarray]:
         if not pairs:
@@ -309,9 +390,10 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self,
         candidates: List[int],
         channel_score: np.ndarray,
-        data_norm: np.ndarray,
+        data_value: np.ndarray,
+        hist_contrib_norm: np.ndarray,
         fairness_debt: np.ndarray,
-        energy_norm: np.ndarray,
+        survival_norm: np.ndarray,
         bw_map_all: Dict[int, float],
     ) -> List[int]:
         if self.selection_policy == "bandwidth_first":
@@ -321,16 +403,17 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             }
             return sorted(candidates, key=lambda cid: times[cid])
         if self.selection_policy == "energy_first":
-            return sorted(candidates, key=lambda cid: energy_norm[cid])
+            return sorted(candidates, key=lambda cid: survival_norm[cid], reverse=True)
 
         scores = {}
         for cid in candidates:
-            scores[cid] = (
+            quality = (
                 self.channel_w * channel_score[cid]
-                + self.data_w * data_norm[cid]
+                + self.data_w * data_value[cid]
                 + self.fair_w * fairness_debt[cid]
-                + self.energy_w * (1.0 - energy_norm[cid])
+                + self.energy_w * hist_contrib_norm[cid]
             )
+            scores[cid] = quality * (max(0.0, survival_norm[cid]) ** self.survival_gamma)
         return sorted(candidates, key=lambda cid: scores[cid], reverse=True)
 
     def initialize_parameters(self, client_manager: ClientManager) -> Parameters:  # type: ignore[override]
@@ -376,22 +459,37 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
 
         bw_map_all = self.bw.allocate_by_stats(self.current_wireless_stats or {}, active_cids)
         channel_score = np.zeros(self.num_clients, dtype=np.float64)
-        energy_arr = np.zeros(self.num_clients, dtype=np.float64)
+        expected_energy_arr = np.zeros(self.num_clients, dtype=np.float64)
 
         for cid in active_cids:
             stats = (self.current_wireless_stats or {}).get(cid, {})
             per = float(stats.get("per", 0.0))
             channel_score[cid] = 1.0 - per
             tx_time = self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map_all.get(cid, 0.0)))
-            energy_arr[cid] = self.energy.comm_energy(tx_time) + self.energy.compute_energy(int(data_sizes[cid]))
+            expected_energy_arr[cid] = self.energy.comm_energy(tx_time) + self.energy.compute_energy(int(data_sizes[cid]))
 
-        max_energy = float(energy_arr.max()) if energy_arr.size > 0 else 0.0
-        energy_norm = energy_arr / max(max_energy, 1e-12) if max_energy > 0 else np.zeros_like(energy_arr)
+        gated_cids: List[int] = []
+        survival_norm = np.zeros(self.num_clients, dtype=np.float64)
+        for cid in active_cids:
+            if not self._can_select_by_cooldown(cid, server_round):
+                continue
+            if not self._is_client_eligible_energy(cid, float(expected_energy_arr[cid])):
+                continue
+            gated_cids.append(cid)
+            rem = float(self.client_energy.get(cid, 0.0))
+            survival_norm[cid] = np.clip(rem / max(1e-12, expected_energy_arr[cid]), 0.0, 1.0)
 
-        ranked = self._rank_clients(active_cids, channel_score, data_norm, fairness_debt, energy_norm, bw_map_all)
+        if not gated_cids:
+            self.last_selected_cids = []
+            return []
+
+        data_value = self._compute_data_value_scores(gated_cids, data_norm)
+        hist_contrib_norm = self._compute_historical_contribution_scores(gated_cids)
+        ranked = self._rank_clients(gated_cids, channel_score, data_value, hist_contrib_norm, fairness_debt, survival_norm, bw_map_all)
         selected_cids = ranked[: min(top_k, len(ranked))]
         self.last_selected_cids = selected_cids
         self.selection_window.append(list(selected_cids))
+        self._update_selection_streaks(selected_cids, server_round)
 
         fit_cfg: Dict[str, Scalar] = {
             "server_round": float(server_round),
@@ -503,6 +601,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             throttle_drop = {int(u["cid"]) for u in ranked[:drop_n]}
 
         valid_sync_updates: List[Tuple[List[np.ndarray], float]] = []
+        contrib_updates: List[Tuple[int, float, float]] = []
         scaffold_deltas: Dict[int, Dict[str, torch.Tensor]] = {}
         scaffold_weights: Dict[int, float] = {}
         for u in candidate_updates:
@@ -510,7 +609,15 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             if cid in throttle_drop:
                 continue
             if np.random.rand() < float(u["per"]):
-                continue
+                if self.current_mode == "semi_sync":
+                    continue
+                else:
+                    # 4 次重传
+                    lost_package_flag = 1
+                    for _ in range(4):
+                        lost_package_flag *= np.random.rand() < float(u["per"])
+                    if lost_package_flag:
+                        continue
 
             weight = float(u["weight"])
             if actions["downweight"]:
@@ -530,6 +637,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             if self.current_mode in ("semi_sync", "bridge") and float(u["tx_time"]) > threshold:
                 continue
             valid_sync_updates.append((u["ndarrays"], weight))
+            contrib_updates.append((cid, weight, float(u["tx_time"])))
 
         sync_result = self._weighted_avg(valid_sync_updates, global_ndarrays) if valid_sync_updates else global_ndarrays
         async_result = global_ndarrays
@@ -558,6 +666,15 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         loss, acc = evaluate_model(self.model_for_eval, self.testloader, self.device)
         self.acc_history.append(float(acc))
         self.energy_history.append(float(round_energy))
+        round_acc_gain = max(0.0, float(acc) - float(self.prev_round_accuracy))
+        total_w = float(sum(w for _, w, _ in contrib_updates))
+        for cid, w, tx in contrib_updates:
+            share = round_acc_gain * (w / max(1e-12, total_w))
+            est_cost = self.energy.comm_energy(tx) + self.energy.compute_energy(int(max(1.0, w)))
+            utility = share / max(1e-12, est_cost)
+            old = float(self.client_contribution_ema.get(cid, 0.0))
+            self.client_contribution_ema[cid] = self.contribution_ema_beta * old + (1.0 - self.contribution_ema_beta) * utility
+        self.prev_round_accuracy = float(acc)
 
         counts = self._compute_selection_counts()
         jain = jain_index(counts)

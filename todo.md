@@ -222,3 +222,41 @@ print(resp.content.decode())
 - Round validation: selected CSV final round all `>=60` in both runs.
 - Retry stats: both runs achieved `11/11` success with single attempt per job.
 - Current status: `hybrid_jitter_invFalse` is strongest in jitter accuracy; `hybrid_jitter_invTrue` still underperforms top baselines and needs further bridge-invariants tuning.
+
+## 12. 2026-03-04 Matrix Rule Update
+- SSH command: `ssh -p 26815 root@connect.bjb2.seetacloud.com`.
+- Pretest (`wsn + hybrid + inv_true`) selected params:
+  - `fl.lr=0.0005`
+  - `algorithm.fedprox_mu=0.01`
+- Fixed config update for matrix:
+  - `fedbuff.async_agg_interval=2`
+- Per-strategy algorithm rule in matrix:
+  - `bandwidth_first`, `energy_first` => `fedavg`
+  - others (`hybrid_opt`, `sync`, `async`, `bridge_free`) => `fedprox`
+
+## 13. 2026-03-05 Hybrid-InvTrue Upgrade Plan
+- Objective: improve `hybrid_jitter_invTrue` while preserving robustness under packet-loss and energy constraints.
+- New mechanism plan:
+  - Add composite client quality score = channel + data_value + historical_contribution + fairness + energy survival.
+  - Add explicit energy guardrails (reserve ratio threshold, expected energy based gating).
+  - Add anti-monopoly selection guard (`max_consecutive_selected` + `cooldown_rounds`).
+  - Relax bridge invariants from strict-throttle to balanced profile when performance is suppressed.
+- Validation pipeline (must all be completed):
+  1) small-scale mechanism validation,
+  2) fedavg vs fedprox contrast under jitter,
+  3) energy-stress test with heterogeneous initial energies,
+  4) full matrix regression and result packaging.
+- Current infra defaults requested by user:
+  - `fl.client_resources.num_cpus=5`
+  - `fl.client_resources.num_gpus=0.2`
+  - `dataset.batch_size=512`
+
+## 14. 2026-03-06 Hybrid Upgrade Runs
+- Small mechanism tuning: `outputs/fl_comp/20260305_233424/C_tune_hybrid_jitter_invtrue`
+  - best profile: `p1_async_sensitive_relaxed_inv`
+- Algorithm contrast: `outputs/fl_comp/20260305_contrast_algo_mu/contrast_algo_mu.csv`
+  - alpha=0.5: `fedprox(mu=0.01)` slightly better than fedavg
+- Energy-stress matrix: `outputs/fl_comp/20260306_004455/B_matrix_20260305_energyStress`
+  - many jobs ended before 60 rounds as expected under low heterogeneous energy
+- Full regression matrix: `outputs/fl_comp/20260306_014534/B_matrix_20260306_regression`
+  - jitter ranking shows `hybrid_jitter_invTrue` top-1 by final accuracy.

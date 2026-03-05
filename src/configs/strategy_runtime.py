@@ -13,7 +13,7 @@ DEFAULTS: Dict[str, Any] = {
         "name": "cifar10",
         "data_dir": "./data",
         "alpha": 0.5,
-        "batch_size": 128,
+        "batch_size": 768,
     },
     "fl": {
         "num_clients": 10,
@@ -22,7 +22,7 @@ DEFAULTS: Dict[str, Any] = {
         "lr": 0.001,
         "fraction_fit": 0.5,
         "seed": 42,
-        "client_resources": {"num_cpus": 2, "num_gpus": 0.25},
+        "client_resources": {"num_cpus": 5, "num_gpus": 0.2},
     },
     "wireless": {
         "wireless_model": "simulated",
@@ -55,6 +55,10 @@ DEFAULTS: Dict[str, Any] = {
     "scheduler": {
         "selection_top_k": 0,
         "fair_window_size": 4,
+        "data_value_weights": {"novelty_w": 0.2, "tail_w": 0.4, "size_w": 0.4},
+        "contribution_ema_beta": 0.9,
+        "energy_guard": {"min_reserve_energy_ratio": 0.1, "future_energy_factor": 1.2, "survival_gamma": 1.5},
+        "selection_guard": {"max_consecutive_selected": 3, "cooldown_rounds": 2},
         "weights": {
             "channel_w": 0.25,
             "data_w": 0.25,

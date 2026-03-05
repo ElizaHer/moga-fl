@@ -126,3 +126,36 @@ Use this command to connect server:
 - Completed run `20260303_014057/B_matrix_tuned` and rerun `20260303_034927/B_matrix_tuned_A2`
 - Both runs produced full ledgers/manifests/summaries/plots; second run archived to `outputs/fl_comp/20260303_034927/accepted/`
 - Note: explicit matrix list counts 10 while doc says 11; added `hybrid_wsn_invFalse` as disambiguation to satisfy 11-job constraint.
+
+## 2026-03-04 Plan Update (PER retransmission change)
+- Remote command updated to: `ssh -p 26815 root@connect.bjb2.seetacloud.com`.
+- Pretest target: `wsn + hybrid_opt + inv_true` to pick best `lr` and `fedprox_mu`.
+- Pretest result used for matrix: `lr=0.0005`, `fedprox_mu=0.01`.
+- Matrix config override: `fedbuff.async_agg_interval=2`.
+- Algorithm assignment rule:
+  - `bandwidth_first` and `energy_first` jobs use `fedavg`.
+  - all other jobs use `fedprox` (`mu=0.01`).
+
+## 2026-03-05 Execution Plan Extension
+- User-approved full execution scope:
+  - update docs (`todo.md`, `agent.md`, `docs/algorithms_explained.md`),
+  - implement hybrid scoring upgrades (data_value, historical_contribution, energy guardrails),
+  - run small mechanism validation,
+  - run fedavg vs fedprox contrast and mu/alpha checks,
+  - run energy-constrained stress tests,
+  - run full matrix regression with updated logic.
+- New target acceptance rule from user:
+  - `async` and `semi-sync(sync)` can be slightly above hybrid due to no switching cost assumptions,
+  - hybrid should remain competitive and improve over prior inv=true runs.
+
+## 2026-03-06 Execution Record
+- Implemented scoring upgrade in `HybridWirelessStrategy`:
+  - composite score with data_value + historical_contribution + energy survival,
+  - energy hard gate + future-feasibility gate,
+  - anti-monopoly selection guard (streak/cooldown).
+- Completed all required experiment groups:
+  1) small mechanism validation,
+  2) fedavg/fedprox contrast + mu/alpha check,
+  3) energy-constrained stress matrix,
+  4) full matrix regression.
+- Regression result: `hybrid_jitter_invTrue` reached top accuracy under jitter in run `20260306_014534`.
