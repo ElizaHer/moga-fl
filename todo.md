@@ -213,7 +213,7 @@ print(resp.content.decode())
 
 ## 10. Server Access
 - Passwordless server connection command:
-  - `ssh -p 14863 root@connect.bjb2.seetacloud.com`
+  - `ssh -p 26815 root@connect.bjb2.seetacloud.com`
 
 ## 11. Latest Run Log (2026-03-03)
 - Run#1: `outputs/fl_comp/20260303_014057/B_matrix_tuned`
@@ -260,3 +260,149 @@ print(resp.content.decode())
   - many jobs ended before 60 rounds as expected under low heterogeneous energy
 - Full regression matrix: `outputs/fl_comp/20260306_014534/B_matrix_20260306_regression`
   - jitter ranking shows `hybrid_jitter_invTrue` top-1 by final accuracy.
+
+## 15. 2026-03-06 Correction + New Execution Plan
+- Matrix correction (authoritative for this round):
+  - WSN only runs 3 jobs: `hybrid_invTrue`, `bandwidth_first`, `energy_first`.
+  - Jitter runs 7 jobs: `hybrid_invFalse`, `hybrid_invTrue`, `sync`, `async`, `bridge_free`, `bandwidth_first`, `energy_first`.
+- Total jobs in this corrected matrix: 10.
+
+### Code-modification scope
+1) Fair algorithm contrast: enforce same algorithm for `hybrid_jitter_invTrue` and `async` in dedicated contrast runs.
+2) Async weakening policy:
+   - apply to pure `async` and hybrid async stage,
+   - stronger stale penalties only for pure `async` (higher staleness_alpha, lower max_staleness, larger min_updates/interval),
+   - hybrid async stage keeps fresh updates less constrained.
+3) Light inv relaxation:
+   - raise thresholds, ease downweight/rate_limit.
+4) WSN/Jitter split policy:
+   - WSN guard relaxed + bridge invariants relaxed,
+   - historical_contribution warmup rounds enabled.
+5) Hybrid-sync-only enhancement:
+   - increase semi_sync_wait_ratio only when strategy is hybrid and current mode is semi_sync,
+   - do not change pure sync behavior.
+6) Bandwidth-first-only energy restriction:
+   - add hot-client consecutive-selection penalty/cooldown,
+   - use heterogeneous initial energies + reserve floor in stress tests.
+
+### Required experiments in this round
+- WSN and Jitter corrected matrix runs.
+- Energy stress tests for both WSN/Jitter.
+- Multi-environment jitter tests with different `jitter_start_state` and `jitter_period_rounds`.
+- If hybrid is clearly superior with little overlap vs baselines, rerun best setup at 100 rounds.
+
+## 16. 2026-03-06 New User-Requested Execution Plan (Convergence + Jitter Grid + Dropout Stress)
+- Source request time: 2026-03-06.
+- This section is authoritative for the current turn.
+
+### 16.1 Stage-A: WSN convergence sweep for hybrid
+- Objective:
+  - run `hybrid_opt` on WSN with increasing `num_rounds` until convergence is reached.
+- Start point:
+  - first run at `num_rounds=100`.
+- Round escalation rule:
+  - if not converged, increase rounds in steps: `100 -> 140 -> 180 -> 220 -> ...` (step `+40`).
+- Energy co-scaling rule (mandatory):
+  - whenever `num_rounds` is increased, scale `energy.initial_client_energy` proportionally:
+    - `E_new = E_base * (num_rounds / 60)`,
+    - and if `client_initial_energies` vector is used, scale each element by the same ratio.
+  - this avoids false non-convergence caused by client dropouts from battery exhaustion.
+- Convergence criterion:
+  - compute metrics on the selected run CSV using the last 20 rounds:
+    - absolute slope of accuracy linear fit `< 0.0008` per round,
+    - accuracy std over last 20 rounds `< 0.006`,
+    - and no persistent degradation (last 5-round mean >= previous 5-round mean - 0.002).
+  - all three must pass to mark converged.
+- Artifact:
+  - save convergence table under `outputs/fl_comp/<run_tag>/analysis/wsn_convergence.csv`.
+
+### 16.2 Stage-B: Jitter environment grid with converged rounds/energy
+- Use converged `num_rounds = R*` and matched energy from Stage-A.
+- Required jitter grid:
+  - `jitter_start_state in {good, bad}`,
+  - `jitter_period_rounds in {20, floor(0.5*R*), floor(0.8*R*)}`.
+- For each cell:
+  - run at least `hybrid_jitter_invTrue` and `hybrid_jitter_invFalse`.
+  - keep all attempt records and select by the current policy (hybrid best).
+- Output:
+  - `outputs/fl_comp/<run_tag>/analysis/jitter_grid_summary.csv`.
+
+### 16.3 Stage-C: Dropout-impact stress comparison (hybrid vs energy_first vs bandwidth_first)
+- Objective:
+  - test whether hybrid is better under client-dropout pressure.
+- Environments:
+  1) WSN stress,
+  2) Jitter stress with fixed `jitter_start_state=bad` and `jitter_period_rounds=20`
+     (this setting is treated as async-like harsh channel regime in this plan).
+- Strategies:
+  - `hybrid_opt`, `energy_first`, `bandwidth_first`.
+- Energy design:
+  - use heterogeneous initial energy vector (high-low mix) plus reserve floor;
+  - keep same total-energy scale as Stage-A converged setting for fairness.
+- Output:
+  - `outputs/fl_comp/<run_tag>/analysis/dropout_stress_summary.csv`
+  - include metrics: final accuracy, final loss, dropout count trend, energy/time cost.
+
+### 16.4 Acceptance + downstream actions
+- If Stage-B/C results are good:
+  - hybrid has stable top-tier accuracy across jitter grid,
+  - and hybrid outperforms `energy_first`/`bandwidth_first` under dropout stress in most tested cells.
+- Then perform:
+  1. copy accepted artifacts to local workspace archive,
+  2. regenerate plots and summaries,
+  3. create git commit and push.
+- If not good:
+  - keep artifacts and record failure reasons + next tuning direction in this TODO.
+
+## 17. 2026-03-07 Follow-up Execution Plan (Adaptive Dropout Stage-C + 200-Round Env Matrix)
+- Source request time: 2026-03-07.
+- This section is authoritative for the current turn.
+
+### 17.1 Adaptive Stage-C rerun with controllable dropout pressure
+- Goal:
+  - reverse-design energy settings to produce **controllable dropout pressure** (not too weak, not collapse),
+  - rerun Stage-C (`hybrid_opt`, `energy_first`, `bandwidth_first`) and evaluate hybrid under dropout stress.
+- Fixed factors:
+  - `num_rounds=200`
+  - environments:
+    - `wsn_stress`
+    - `jitter_stress` with `jitter_start_state=bad`, `jitter_period_rounds=20`
+- Adaptive loop rule:
+  1. run one Stage-C batch with an energy profile,
+  2. check dropout pressure level:
+     - too weak: nearly no exhaustion/dropout indicators across jobs,
+     - too strong: severe collapse (very low final acc and/or widespread exhaustion),
+     - controllable: noticeable dropout pressure while training still progresses.
+  3. if too weak/too strong, adjust energy profile and rerun Stage-C.
+- Stop rule:
+  - if controllable pressure is achieved and hybrid still not better than baselines, stop reruns (no further loop).
+- Required outputs:
+  - `analysis/dropout_stress_summary.csv` for each loop,
+  - `analysis/dropout_pressure_diagnosis.csv` with pressure classification and rerun decision.
+
+### 17.2 Fixed 200-round environment matrix test
+- Goal:
+  - run a 200-round environment matrix to compare strategy behavior under requested channel conditions.
+- Matrix environments:
+  - `wsn`
+  - `jitter(start=good, period=20)`
+  - `jitter(start=good, period=100)`
+  - `jitter(start=good, period=160)`
+  - `jitter(start=bad, period=20)`
+  - `jitter(start=bad, period=100)`
+  - `jitter(start=bad, period=160)`
+- Strategy set:
+  - `hybrid_opt`, `energy_first`, `bandwidth_first`
+- Fixed factors:
+  - `num_rounds=200`, `alpha=0.5`, `seed=42`
+- Output:
+  - `analysis/env_matrix_200_summary.csv`
+  - include final accuracy, final loss, exhausted-client count, and selected csv path.
+
+### 17.3 Acceptance and handling
+- If results are good:
+  - archive accepted artifacts,
+  - generate plots,
+  - commit and push.
+- If not good:
+  - preserve all outputs and record why acceptance failed plus next tuning direction.

@@ -118,10 +118,10 @@ If results are considered expected/qualified:
 
 ## Server Login (Passwordless)
 Use this command to connect server:
-`ssh -p 14863 root@connect.bjb2.seetacloud.com`
+`ssh -p 26815 root@connect.bjb2.seetacloud.com`
 
 ## 2026-03-03 Execution Record
-- Remote login switched to: `ssh -p 14863 root@connect.bjb2.seetacloud.com`
+- Remote login switched to: `ssh -p 26815 root@connect.bjb2.seetacloud.com`
 - Added strict matrix runner: `scripts/run_matrix_tuned.py`
 - Completed run `20260303_014057/B_matrix_tuned` and rerun `20260303_034927/B_matrix_tuned_A2`
 - Both runs produced full ledgers/manifests/summaries/plots; second run archived to `outputs/fl_comp/20260303_034927/accepted/`

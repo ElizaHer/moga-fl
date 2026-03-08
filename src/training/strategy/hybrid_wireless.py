@@ -79,10 +79,17 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         )
         self.max_consecutive_selected = int(self.selection_guard_cfg.get("max_consecutive_selected", 3))
         self.cooldown_rounds = int(self.selection_guard_cfg.get("cooldown_rounds", 2))
+        self.wsn_guard_relax_cfg = (
+            scheduler_cfg.get("wsn_guard_relax", {})
+            if isinstance(scheduler_cfg.get("wsn_guard_relax", {}), dict)
+            else {}
+        )
         self.algorithm = str(algorithm_cfg.get("name", "fedavg")).lower()
         self.strategy_name = str(cfg.get("strategy_name", "hybrid_opt")).lower()
         self.fedprox_mu = float(algorithm_cfg.get("fedprox_mu", 0.0))
         self.semi_sync_wait_ratio = float(controller_cfg.get("semi_sync_wait_ratio", 0.7))
+        self.hybrid_semi_sync_wait_ratio = float(controller_cfg.get("hybrid_semi_sync_wait_ratio", self.semi_sync_wait_ratio))
+        self.enable_hybrid_sync_boost = bool(controller_cfg.get("enable_hybrid_sync_boost", True))
         self.mode_policy = str(controller_cfg.get("mode_policy", "hybrid")).lower()
         self.selection_policy = str(scheduler_cfg.get("selection_policy", "hybrid")).lower()
         self.wireless_model = str(wireless_cfg.get("wireless_model", "simulated")).lower()
@@ -94,6 +101,16 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.bridge_inv_enable = bool(self.bridge_inv_cfg.get("enable", False))
         self.prev_mean_fair_debt: Optional[float] = None
         self.bridge_fail_streak = 0
+        self.historical_warmup_rounds = int(scheduler_cfg.get("historical_contribution_warmup_rounds", 0))
+        self.bandwidth_first_penalty_cfg = (
+            scheduler_cfg.get("bandwidth_first_penalty", {})
+            if isinstance(scheduler_cfg.get("bandwidth_first_penalty", {}), dict)
+            else {}
+        )
+        self.bandwidth_first_penalty_enable = bool(self.bandwidth_first_penalty_cfg.get("enable", False))
+        self.bandwidth_first_penalty_streak = int(self.bandwidth_first_penalty_cfg.get("streak_threshold", 3))
+        self.bandwidth_first_energy_multiplier = float(self.bandwidth_first_penalty_cfg.get("energy_multiplier", 1.0))
+        self.bandwidth_first_forced_cooldown_rounds = int(self.bandwidth_first_penalty_cfg.get("cooldown_rounds", 0))
 
         weights = scheduler_cfg.get("weights", {}) if isinstance(scheduler_cfg.get("weights", {}), dict) else {}
         self.channel_w = float(weights.get("channel_w", 0.25))
@@ -134,6 +151,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
 
         self.initial_client_energy = float(energy_cfg.get("initial_client_energy", 100.0))
         self.client_initial_energies = energy_cfg.get("client_initial_energies")
+        self.min_energy_floor_per_round = float(energy_cfg.get("min_energy_floor_per_round", 0.0))
         self.client_energy: Dict[int, float] = {}
         self.exhausted_clients: set[int] = set()
         self._init_client_energy()
@@ -143,6 +161,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.prev_round_accuracy: float = 0.0
 
         self._base_bandwidth_budget = float(self.bw.budget_mb)
+        self._apply_wsn_guard_relax()
 
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         metrics_dir = os.path.join("outputs", "hybrid_metrics", self.strategy_name)
@@ -241,6 +260,27 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
     def _can_select_by_cooldown(self, cid: int, server_round: int) -> bool:
         return int(self.client_cooldown_until.get(cid, 0)) < int(server_round)
 
+    def _apply_wsn_guard_relax(self) -> None:
+        if self.wireless_model != "wsn":
+            return
+        enable = bool(self.wsn_guard_relax_cfg.get("enable", False))
+        if not enable:
+            return
+        reserve_ratio_mul = float(self.wsn_guard_relax_cfg.get("reserve_ratio_multiplier", 1.0))
+        future_factor_mul = float(self.wsn_guard_relax_cfg.get("future_factor_multiplier", 1.0))
+        self.min_reserve_energy_ratio = max(0.0, self.min_reserve_energy_ratio * reserve_ratio_mul)
+        self.future_energy_factor = max(0.1, self.future_energy_factor * future_factor_mul)
+        if "max_consecutive_selected" in self.wsn_guard_relax_cfg:
+            self.max_consecutive_selected = int(self.wsn_guard_relax_cfg.get("max_consecutive_selected", self.max_consecutive_selected))
+        if "cooldown_rounds" in self.wsn_guard_relax_cfg:
+            self.cooldown_rounds = int(self.wsn_guard_relax_cfg.get("cooldown_rounds", self.cooldown_rounds))
+
+    def _effective_semi_sync_wait_ratio(self) -> float:
+        ratio = self.semi_sync_wait_ratio
+        if self.enable_hybrid_sync_boost and self.current_mode in ("semi_sync", "bridge"):
+            ratio = self.hybrid_semi_sync_wait_ratio
+        return float(np.clip(ratio, 0.5, 0.99))
+
     def _is_client_eligible_energy(self, cid: int, expected_round_energy: float) -> bool:
         rem = float(self.client_energy.get(cid, 0.0))
         if rem <= 0.0:
@@ -268,8 +308,10 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             out[cid] = self.novelty_w * novelty[cid] + self.tail_w * rarity[cid] + self.size_w * data_norm[cid]
         return out
 
-    def _compute_historical_contribution_scores(self, active_cids: List[int]) -> np.ndarray:
+    def _compute_historical_contribution_scores(self, active_cids: List[int], server_round: int) -> np.ndarray:
         out = np.zeros(self.num_clients, dtype=np.float64)
+        if int(server_round) <= self.historical_warmup_rounds:
+            return out
         vals = np.asarray([float(self.client_contribution_ema.get(cid, 0.0)) for cid in range(self.num_clients)], dtype=np.float64)
         vmin, vmax = float(vals.min()), float(vals.max())
         if vmax > vmin:
@@ -285,6 +327,15 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         for cid in range(self.num_clients):
             if cid in selected:
                 self.client_selection_streak[cid] = int(self.client_selection_streak.get(cid, 0)) + 1
+                if (
+                    self.selection_policy == "bandwidth_first"
+                    and self.bandwidth_first_penalty_enable
+                    and self.bandwidth_first_forced_cooldown_rounds > 0
+                    and self.client_selection_streak[cid] >= self.bandwidth_first_penalty_streak
+                ):
+                    self.client_cooldown_until[cid] = int(server_round) + int(max(1, self.bandwidth_first_forced_cooldown_rounds))
+                    self.client_selection_streak[cid] = 0
+                    continue
                 if self.max_consecutive_selected > 0 and self.client_selection_streak[cid] >= self.max_consecutive_selected:
                     self.client_cooldown_until[cid] = int(server_round) + int(max(1, self.cooldown_rounds))
                     self.client_selection_streak[cid] = 0
@@ -484,7 +535,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             return []
 
         data_value = self._compute_data_value_scores(gated_cids, data_norm)
-        hist_contrib_norm = self._compute_historical_contribution_scores(gated_cids)
+        hist_contrib_norm = self._compute_historical_contribution_scores(gated_cids, server_round)
         ranked = self._rank_clients(gated_cids, channel_score, data_value, hist_contrib_norm, fairness_debt, survival_norm, bw_map_all)
         selected_cids = ranked[: min(top_k, len(ranked))]
         self.last_selected_cids = selected_cids
@@ -535,7 +586,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         threshold = float("inf")
         if scheduled_cids and self.current_mode in ("semi_sync", "bridge"):
             tx_list = [tx_times[cid] for cid in scheduled_cids]
-            threshold = float(np.quantile(np.asarray(tx_list, dtype=np.float64), self.semi_sync_wait_ratio))
+            threshold = float(np.quantile(np.asarray(tx_list, dtype=np.float64), self._effective_semi_sync_wait_ratio()))
 
         candidate_updates: List[Dict[str, object]] = []
         round_energy = 0.0
@@ -551,10 +602,17 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             tx_time = tx_times.get(cid, self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map.get(cid, 0.0))))
             per = float((wireless_stats.get(cid, {})).get("per", 0.0))
             client_round_energy = self.energy.comm_energy(tx_time) + self.energy.compute_energy(num_examples)
+            if (
+                self.selection_policy == "bandwidth_first"
+                and self.bandwidth_first_penalty_enable
+                and self.client_selection_streak.get(cid, 0) >= self.bandwidth_first_penalty_streak
+            ):
+                client_round_energy *= max(1.0, self.bandwidth_first_energy_multiplier)
             round_energy += client_round_energy
             remaining = float(self.client_energy.get(cid, 0.0)) - float(client_round_energy)
-            self.client_energy[cid] = max(0.0, remaining)
-            if remaining <= 0.0:
+            clamped_remaining = max(self.min_energy_floor_per_round, remaining)
+            self.client_energy[cid] = max(0.0, clamped_remaining)
+            if clamped_remaining <= 0.0:
                 self.exhausted_clients.add(cid)
                 continue
 
@@ -730,6 +788,7 @@ class SyncStrategy(HybridWirelessStrategy):
         cfg = dict(cfg)
         controller = dict(cfg.get("controller", {}))
         controller["mode_policy"] = "semi_sync"
+        controller["enable_hybrid_sync_boost"] = False
         cfg["controller"] = controller
         algorithm = dict(cfg.get("algorithm", {}))
         algorithm.setdefault("name", "fedavg")

@@ -51,14 +51,29 @@ DEFAULTS: Dict[str, Any] = {
     "energy": {
         "initial_client_energy": 100.0,
         "client_initial_energies": None,
+        "min_energy_floor_per_round": 0.0,
     },
     "scheduler": {
         "selection_top_k": 0,
         "fair_window_size": 4,
         "data_value_weights": {"novelty_w": 0.2, "tail_w": 0.4, "size_w": 0.4},
         "contribution_ema_beta": 0.9,
+        "historical_contribution_warmup_rounds": 8,
         "energy_guard": {"min_reserve_energy_ratio": 0.1, "future_energy_factor": 1.2, "survival_gamma": 1.5},
         "selection_guard": {"max_consecutive_selected": 3, "cooldown_rounds": 2},
+        "wsn_guard_relax": {
+            "enable": False,
+            "reserve_ratio_multiplier": 0.6,
+            "future_factor_multiplier": 0.85,
+            "max_consecutive_selected": 8,
+            "cooldown_rounds": 0,
+        },
+        "bandwidth_first_penalty": {
+            "enable": False,
+            "streak_threshold": 3,
+            "energy_multiplier": 1.6,
+            "cooldown_rounds": 2,
+        },
         "weights": {
             "channel_w": 0.25,
             "data_w": 0.25,
@@ -68,6 +83,7 @@ DEFAULTS: Dict[str, Any] = {
     },
     "controller": {
         "semi_sync_wait_ratio": 0.7,
+        "hybrid_semi_sync_wait_ratio": 0.86,
         "window_size": 4,
         "gate_thresholds": {"to_async": 0.58, "to_semi_sync": 0.42},
         "hysteresis_margin": 0.03,
@@ -78,14 +94,14 @@ DEFAULTS: Dict[str, Any] = {
         "mode_policy": "hybrid",
         "bridge_invariants": {
             "enable": False,
-            "energy_budget_round": 120.0,
-            "upload_time_budget_round": 2.5,
+            "energy_budget_round": 140.0,
+            "upload_time_budget_round": 2.9,
             "fairness_debt_trend": "non_increasing",
             "violation_weights": {"budget": 0.5, "stale": 0.3, "fair": 0.2},
-            "thresholds": {"th1": 0.10, "th2": 0.25, "th3": 0.45},
-            "downweight_factor": 0.5,
-            "throttle_drop_ratio": 0.3,
-            "rate_limit_factor": 0.8,
+            "thresholds": {"th1": 0.16, "th2": 0.32, "th3": 0.52},
+            "downweight_factor": 0.7,
+            "throttle_drop_ratio": 0.2,
+            "rate_limit_factor": 0.92,
             "bridge_extend_rounds": 1,
             "max_bridge_rounds": 8,
             "fail_streak_for_extend": 2,
@@ -97,6 +113,18 @@ DEFAULTS: Dict[str, Any] = {
         "staleness_alpha": 1.0,
         "max_staleness": 8,
         "async_agg_interval": 2,
+        "pure_async_profile": {
+            "staleness_alpha": 1.4,
+            "max_staleness": 6,
+            "min_updates_to_aggregate": 10,
+            "async_agg_interval": 3,
+        },
+        "hybrid_async_profile": {
+            "staleness_alpha": 0.9,
+            "max_staleness": 8,
+            "min_updates_to_aggregate": 6,
+            "async_agg_interval": 2,
+        },
     },
 }
 
