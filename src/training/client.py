@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import flwr as fl
 from flwr.common import Scalar
 
@@ -18,7 +20,8 @@ class CifarClient(fl.client.NumPyClient):  # type: ignore[misc]
         lr: float,
     ) -> None:
         self.cid = cid
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        force_cpu = str(os.environ.get("FORCE_CPU", "")).strip().lower() in {"1", "true", "yes", "on"}
+        self.device = torch.device("cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = build_resnet18().to(self.device)
         self.trainloader = trainloader
         self.testloader = testloader

@@ -37,22 +37,26 @@ def _aggregate_metrics_csv(csv_path: str) -> Dict[str, float]:
     """
     if not os.path.exists(csv_path):
         # Defensive: return neutral metrics rather than crashing the optimizer
-        return {"acc": 0.0, "time": 0.0, "fairness": 0.0, "energy": 0.0}
+        return {"acc": 0.0, "time": 0.0, "energy": 0.0, "comm_cost": 0.0, "fairness": 0.0}
 
     df = pd.read_csv(csv_path)
     if df.empty:
-        return {"acc": 0.0, "time": 0.0, "fairness": 0.0, "energy": 0.0}
+        return {"acc": 0.0, "time": 0.0, "energy": 0.0, "comm_cost": 0.0, "fairness": 0.0}
 
     # Column names come from HybridWirelessStrategy._init_metrics_file
     acc = float(df["accuracy"].mean()) if "accuracy" in df.columns else 0.0
-    fairness = float(df["jain"].mean()) if "jain" in df.columns else 0.0
-    energy = float(df["energy"].mean()) if "energy" in df.columns else 0.0
     time = (
         float(df["est_upload_time"].mean())
         if "est_upload_time" in df.columns
         else 0.0
     )
-    return {"acc": acc, "time": time, "fairness": fairness, "energy": energy}
+    energy = float(df["energy"].mean()) if "energy" in df.columns else 0.0
+    fairness = float(df["jain"].mean()) if "jain" in df.columns else 0.0
+    # Communication-cost proxy: average active clients * effective payload.
+    topk_mean = float(df["topk"].mean()) if "topk" in df.columns else 0.0
+    payload_mb = float(df.get("payload_mb", pd.Series([1.0])).mean()) if "payload_mb" in df.columns else 1.0
+    comm_cost = topk_mean * payload_mb
+    return {"acc": acc, "time": time, "energy": energy, "comm_cost": comm_cost, "fairness": fairness}
 
 
 def make_flower_sim_runner(
@@ -78,9 +82,10 @@ def make_flower_sim_runner(
     -------
     runner(params) -> metrics
         ``params`` is a GA individual with keys:
-        ``energy_w, channel_w, data_w, fair_w, selection_top_k, staleness_alpha``.
+        ``energy_w, channel_w, data_w, fair_w, selection_top_k, bandwidth_alloc_factor,``
+        ``staleness_alpha, bridge_to_async, bridge_to_semi_sync, compression_ratio``.
         The returned ``metrics`` dict matches the GA objective interface:
-        ``{"acc", "time", "fairness", "energy"}``.
+        ``{"acc", "time", "energy", "comm_cost", "fairness"}``.
     """
 
     base_cfg = _load_base_cfg(cfg_path_or_dict)
@@ -111,12 +116,28 @@ def make_flower_sim_runner(
         scheduler["selection_top_k"] = int(max(1, top_k))
         cfg["scheduler"] = scheduler
 
+        # Wireless knobs
+        wireless = cfg.get("wireless", {}) if isinstance(cfg.get("wireless", {}), dict) else {}
+        base_bw = float(wireless.get("bandwidth_budget_mb_per_round", 12.0))
+        bw_factor = float(params.get("bandwidth_alloc_factor", 1.0))
+        wireless["bandwidth_budget_mb_per_round"] = float(max(1e-3, base_bw * bw_factor))
+        wireless["payload_compression_ratio"] = float(params.get("compression_ratio", wireless.get("payload_compression_ratio", 1.0)))
+        cfg["wireless"] = wireless
+
         # FedBuff staleness_alpha (top-level for Flower config)
         fedbuff = cfg.get("fedbuff", {}) if isinstance(cfg.get("fedbuff", {}), dict) else {}
         fedbuff["staleness_alpha"] = float(
             params.get("staleness_alpha", fedbuff.get("staleness_alpha", 1.0))
         )
         cfg["fedbuff"] = fedbuff
+
+        # Controller bridge thresholds
+        controller = cfg.get("controller", {}) if isinstance(cfg.get("controller", {}), dict) else {}
+        gates = controller.get("gate_thresholds", {}) if isinstance(controller.get("gate_thresholds", {}), dict) else {}
+        gates["to_async"] = float(params.get("bridge_to_async", gates.get("to_async", 0.58)))
+        gates["to_semi_sync"] = float(params.get("bridge_to_semi_sync", gates.get("to_semi_sync", 0.42)))
+        controller["gate_thresholds"] = gates
+        cfg["controller"] = controller
 
         # Run Flower simulation and aggregate metrics from the strategy CSV
         result = run_hybrid_flower_cifar(cfg, strategy_name=strategy_name)

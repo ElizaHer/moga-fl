@@ -93,6 +93,8 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self.mode_policy = str(controller_cfg.get("mode_policy", "hybrid")).lower()
         self.selection_policy = str(scheduler_cfg.get("selection_policy", "hybrid")).lower()
         self.wireless_model = str(wireless_cfg.get("wireless_model", "simulated")).lower()
+        self.payload_mb = float(wireless_cfg.get("payload_mb", 1.0))
+        self.payload_compression_ratio = float(wireless_cfg.get("payload_compression_ratio", 1.0))
         self.bridge_inv_cfg = (
             controller_cfg.get("bridge_invariants", {})
             if isinstance(controller_cfg.get("bridge_invariants", {}), dict)
@@ -197,10 +199,14 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                     "energy",
                     "est_upload_time",
                     "bw_factor",
+                    "payload_mb",
                     "topk",
                     "exhausted_clients",
                 ]
             )
+
+    def _effective_payload_mb(self) -> float:
+        return max(1e-4, float(self.payload_mb) * float(np.clip(self.payload_compression_ratio, 0.1, 1.0)))
 
     def _log_metrics(
         self,
@@ -216,6 +222,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         topk: int,
         exhausted_clients: List[int],
     ) -> None:
+        payload_mb = self._effective_payload_mb()
         with open(self.metrics_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -229,6 +236,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
                     float(energy),
                     float(est_upload_time),
                     float(bw_factor),
+                    float(payload_mb),
                     int(topk),
                     "|".join(str(cid) for cid in exhausted_clients),
                 ]
@@ -449,7 +457,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
     ) -> List[int]:
         if self.selection_policy == "bandwidth_first":
             times = {
-                cid: self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map_all.get(cid, 0.0)))
+                cid: self.bw.estimate_tx_time(payload_mb=self._effective_payload_mb(), allocated_mb=float(bw_map_all.get(cid, 0.0)))
                 for cid in candidates
             }
             return sorted(candidates, key=lambda cid: times[cid])
@@ -516,7 +524,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             stats = (self.current_wireless_stats or {}).get(cid, {})
             per = float(stats.get("per", 0.0))
             channel_score[cid] = 1.0 - per
-            tx_time = self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map_all.get(cid, 0.0)))
+            tx_time = self.bw.estimate_tx_time(payload_mb=self._effective_payload_mb(), allocated_mb=float(bw_map_all.get(cid, 0.0)))
             expected_energy_arr[cid] = self.energy.comm_energy(tx_time) + self.energy.compute_energy(int(data_sizes[cid]))
 
         gated_cids: List[int] = []
@@ -576,7 +584,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
         self._update_bandwidth_budget()
         bw_map = self.bw.allocate_by_stats(wireless_stats, scheduled_cids)
         tx_times = {
-            cid: self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map.get(cid, 0.0)))
+            cid: self.bw.estimate_tx_time(payload_mb=self._effective_payload_mb(), allocated_mb=float(bw_map.get(cid, 0.0)))
             for cid in scheduled_cids
         }
         print(f"[round {server_round}] bandwidth_allocation_mb={{{', '.join(f'{cid}:{bw_map.get(cid, 0.0):.4f}' for cid in scheduled_cids)}}}")
@@ -599,7 +607,7 @@ class HybridWirelessStrategy(Strategy):  # type: ignore[misc]
             if num_examples <= 0:
                 continue
 
-            tx_time = tx_times.get(cid, self.bw.estimate_tx_time(payload_mb=1.0, allocated_mb=float(bw_map.get(cid, 0.0))))
+            tx_time = tx_times.get(cid, self.bw.estimate_tx_time(payload_mb=self._effective_payload_mb(), allocated_mb=float(bw_map.get(cid, 0.0))))
             per = float((wireless_stats.get(cid, {})).get("per", 0.0))
             client_round_energy = self.energy.comm_energy(tx_time) + self.energy.compute_energy(num_examples)
             if (

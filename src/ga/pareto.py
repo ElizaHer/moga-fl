@@ -2,18 +2,22 @@ from typing import List, Dict
 
 
 def dominates(a: Dict[str, float], b: Dict[str, float]) -> bool:
-    # a dominates b if better or equal in all, and strictly better in one
+    # Maximize: acc, fairness. Minimize: time, energy, comm_cost.
+    comm_a = float(a.get("comm_cost", a.get("time", 0.0)))
+    comm_b = float(b.get("comm_cost", b.get("time", 0.0)))
     better_or_equal = (
-        a['acc'] >= b['acc'] and
-        a['fairness'] >= b['fairness'] and
-        a['time'] <= b['time'] and
-        a['energy'] <= b['energy']
+        float(a["acc"]) >= float(b["acc"])
+        and float(a["fairness"]) >= float(b["fairness"])
+        and float(a["time"]) <= float(b["time"])
+        and float(a["energy"]) <= float(b["energy"])
+        and comm_a <= comm_b
     )
     strictly_better = (
-        a['acc'] > b['acc'] or
-        a['fairness'] > b['fairness'] or
-        a['time'] < b['time'] or
-        a['energy'] < b['energy']
+        float(a["acc"]) > float(b["acc"])
+        or float(a["fairness"]) > float(b["fairness"])
+        or float(a["time"]) < float(b["time"])
+        or float(a["energy"]) < float(b["energy"])
+        or comm_a < comm_b
     )
     return better_or_equal and strictly_better
 

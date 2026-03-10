@@ -406,3 +406,153 @@ print(resp.content.decode())
   - commit and push.
 - If not good:
   - preserve all outputs and record why acceptance failed plus next tuning direction.
+
+## 18. 2026-03-08 MOGA-FL Upgrade + Experiment Plan (Authoritative for GA round)
+- Source request time: 2026-03-08.
+- Goal: upgrade MOGA-FL to full joint-encoding + 5-objective optimization and run reproducible GA experiments.
+
+### 18.1 Required MOGA-FL encoding (chromosome)
+- Scheduler score weights: `energy_w`, `channel_w`, `data_w`, `fair_w`.
+- Selection scale: `selection_top_k`.
+- Bandwidth allocation factor: `bandwidth_alloc_factor` (scales `wireless.bandwidth_budget_mb_per_round`).
+- Async staleness decay: `staleness_alpha`.
+- Bridge trigger thresholds: `bridge_to_async`, `bridge_to_semi_sync`.
+- Compression ratio: `compression_ratio` (mapped to `wireless.payload_compression_ratio`).
+
+### 18.2 Required objectives
+- Maximize: `acc`, `fairness`.
+- Minimize: `time`, `energy`, `comm_cost`.
+- `comm_cost` uses per-round communication proxy from metrics csv (`topk * payload_mb` mean).
+
+### 18.3 Algorithm framework requirements
+- Two-stage co-evolution:
+  1. NSGA-III stage for high-dimensional spread (reference-direction niching).
+  2. MOEA/D stage for decomposition-based neighborhood convergence.
+- Island migration: NSGA-III non-dominated elites migrate to MOEA/D initialization.
+- Feasible-region local search:
+  - around energy budget / upload-time budget / staleness-sensitive region,
+  - apply local perturbation + constraint-guided nudging.
+- Multi-fidelity:
+  - early low-fidelity runs for broad screening,
+  - high-fidelity reevaluation on elite + neighbors.
+- Elite memory:
+  - cache evaluated individuals (low/high fidelity) by normalized chromosome key.
+
+### 18.4 Experiment execution matrix (GA side)
+- Config baseline: `src/configs/strategies/hybrid_opt.yaml`.
+- Seed set: `{42, 43, 44}`.
+- Preferences: `{time, energy, fairness}`.
+- Algorithms to run:
+  - `moga_fl` (primary),
+  - `nsga3` (ablation),
+  - `moead` (ablation),
+  - optional `pymoo_nsga3` if dependency is available.
+- Default run arguments:
+  - `--pop 24`,
+  - `--generations 10`,
+  - `--num-rounds 80` (GA evaluation budget).
+
+### 18.5 Acceptance criteria for this GA round
+- `moga_fl` should produce Pareto candidates with all 5 objectives present.
+- For each preference (`time`/`energy`/`fairness`), best deployment config is exported.
+- At least one `moga_fl` candidate strictly improves over ablation candidates on 3 or more objectives under same seed.
+- All runs must produce:
+  - `outputs/results/pareto_candidates.csv`,
+  - `outputs/results/best_moga_fl_config.yaml`,
+  - per-run log and summary snapshot under `outputs/fl_comp/<run_tag>/ga_moga_fl/`.
+
+### 18.6 Remote execution and artifacts
+- Remote host: `ssh -p 26815 root@connect.bjb2.seetacloud.com`.
+- Remote project path: `/root/autodl-tmp/moga-fl`.
+- Run tag for this round: `20260308_moga_fl_upgrade`.
+- Output root:
+  - `/root/autodl-tmp/moga-fl/outputs/fl_comp/20260308_moga_fl_upgrade/ga_moga_fl/`
+- Must archive:
+  - command scripts,
+  - run logs,
+  - pareto csv,
+  - best config yaml,
+  - summary markdown (`ga_summary.md`) with preference-wise chosen solutions and key metrics.
+
+## 19. 2026-03-08 GA Tiny Experiment Plan (Fast Validation)
+- Purpose: validate upgraded MOGA-FL pipeline end-to-end with minimal compute budget.
+- Run tag: `20260308_moga_fl_upgrade`.
+- Output root: `outputs/fl_comp/20260308_moga_fl_upgrade/ga_moga_fl/`.
+
+### 19.1 Fixed setup
+- Strategy config: `src/configs/strategies/hybrid_opt.yaml`.
+- Algorithm: `moga_fl`.
+- Seed: `42`.
+- Preference: `time` (default in quick validation).
+- GA budget:
+  - `pop=2~4`
+  - `generations=1`
+  - `num_rounds=2~3` (for low-fidelity simulation speed)
+
+### 19.2 Environment safeguards
+- Force CPU mode for validation runs to avoid GPU OOM interference:
+  - `FORCE_CPU=1`
+  - `CUDA_VISIBLE_DEVICES=-1`
+- Ensure only one GA task active during tiny run.
+
+### 19.3 Expected artifacts
+- `pareto_candidates_moga_fl_seed42_tiny.csv`
+- `best_moga_fl_config_seed42_tiny.yaml`
+- `run_moga_fl_seed42_tiny.log`
+
+### 19.4 Tiny acceptance criteria
+- Pareto CSV exists and includes all 5 objectives:
+  - `acc,time,energy,comm_cost,fairness`
+- Best YAML exists and includes upgraded decision variables mapping:
+  - scheduler weights + top-k + staleness + gate thresholds + compression/bandwidth mapping.
+- No script-level crash in log tail (normal completion marker from GA script).
+
+## 20. 2026-03-08 GA Full Experiment Plan (Authoritative Matrix)
+- Purpose: run complete reproducible comparison for upgraded MOGA-FL under deployment preferences.
+- Run tag: `20260308_moga_fl_upgrade`.
+- Output root: `outputs/fl_comp/20260308_moga_fl_upgrade/ga_moga_fl/`.
+
+### 20.1 Matrix dimensions
+- Seeds: `{42, 43, 44}`.
+- Preferences: `{time, energy, fairness}`.
+- Algorithms: `{moga_fl, nsga3, moead}`.
+- Total jobs: `3 x 3 x 3 = 27`.
+
+### 20.2 Recommended resource profile
+- Primary profile (if GPU is clean and stable):
+  - `pop=8`
+  - `generations=2`
+  - `num_rounds=8`
+- Safe CPU fallback profile (if OOM/noisy GPU):
+  - `FORCE_CPU=1`
+  - `CUDA_VISIBLE_DEVICES=-1`
+  - `pop=4`
+  - `generations=1`
+  - `num_rounds=3`
+
+### 20.3 Execution policy
+- Before full run:
+  1. kill stale GA/Ray processes,
+  2. verify no conflicting `run_ga_optimization.py` remains,
+  3. launch only one matrix driver script.
+- During run:
+  - append each attempt to `ga_run_ledger.csv`.
+  - status field must be `success/failed` with `rc` note.
+
+### 20.4 Required artifacts per successful job
+- `pareto_<algo>_seed<seed>_pref<pref>.csv`
+- `best_<algo>_seed<seed>_pref<pref>.yaml`
+- `<algo>_seed<seed>_pref<pref>.log`
+
+### 20.5 Full-run summary artifacts
+- `ga_run_ledger.csv`
+- `ga_summary.md` including:
+  - total/success/failed counts,
+  - per-job output links,
+  - failure reasons with log references.
+
+### 20.6 Full acceptance criteria
+- At least `27/27` jobs complete successfully (or explicit documented fallback if hardware limits force reduced matrix).
+- `moga_fl` outputs valid Pareto sets under all three preferences for each seed.
+- For each preference, at least one `moga_fl` solution dominates corresponding ablation solution on >=3 objectives in same seed (if not met, record as non-acceptance with reason).
+- Archive accepted results and chosen configs into run folder for downstream comparison.

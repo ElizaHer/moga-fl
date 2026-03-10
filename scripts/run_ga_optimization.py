@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import copy
@@ -16,7 +16,7 @@ from src.ga.sim_runner_flower import make_flower_sim_runner
 
 
 def _select_best(pop: List[Dict[str, Any]], metrics: List[Dict[str, float]], preference: str) -> int:
-    """根据偏好从候选解中选出一个“部署用”解。"""
+    """Select one deployable solution from Pareto candidates by preference."""
     if not pop or not metrics:
         return 0
     pref = str(preference or "time").lower()
@@ -27,12 +27,13 @@ def _select_best(pop: List[Dict[str, Any]], metrics: List[Dict[str, float]], pre
         time = float(m.get("time", 0.0))
         fairness = float(m.get("fairness", 0.0))
         energy = float(m.get("energy", 0.0))
+        comm = float(m.get("comm_cost", time))
         if pref == "fairness":
             score = fairness + 0.05 * acc
         elif pref == "energy":
-            score = -energy + 0.1 * acc
-        else:  # time 优先
-            score = -time + 0.1 * acc
+            score = -energy - 0.2 * comm + 0.1 * acc
+        else:  # time priority
+            score = -time - 0.2 * comm + 0.1 * acc
         if best_score is None or score > best_score:
             best_score = score
             best_idx = i
@@ -41,18 +42,18 @@ def _select_best(pop: List[Dict[str, Any]], metrics: List[Dict[str, float]], pre
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GA optimization for hybrid wireless FL (Flower)")
-    parser.add_argument("--config", type=str, default="", help="策略 YAML 路径，默认使用 src/configs/strategies/<strategy>.yaml")
-    parser.add_argument("--strategy", type=str, default="hybrid_opt", help="策略名称，对应 YAML 与 Flower strategy factory")
-    parser.add_argument("--generations", type=int, default=6, help="GA 迭代代数")
-    parser.add_argument("--pop", type=int, default=16, help="种群大小")
+    parser.add_argument("--config", type=str, default="", help="Path to strategy YAML; default uses src/configs/strategies/<strategy>.yaml")
+    parser.add_argument("--strategy", type=str, default="hybrid_opt", help="Strategy name for YAML and Flower strategy factory")
+    parser.add_argument("--generations", type=int, default=6, help="GA generations")
+    parser.add_argument("--pop", type=int, default=16, help="Population size")
     parser.add_argument(
         "--algo",
         type=str,
         default="nsga3",
         choices=["nsga3", "moead", "moga_fl", "pymoo_nsga3"],
-        help="选择使用的多目标优化算法",
+        help="Optimizer backend",
     )
-    parser.add_argument("--num-rounds", type=int, default=None, help="可选：覆盖 YAML 中 fl.num_rounds 以加速验证")
+    parser.add_argument("--num-rounds", type=int, default=None, help="Optional override for fl.num_rounds")
     args = parser.parse_args()
 
     config_path = args.config.strip() or default_strategy_yaml(args.strategy)
@@ -64,7 +65,6 @@ def main() -> None:
         fl["num_rounds"] = int(args.num_rounds)
         cfg["fl"] = fl
 
-    # 低保真与高保真评估器：均基于 Flower HybridWirelessStrategy
     low_sim = make_flower_sim_runner(cfg, strategy_name=args.strategy, round_scale=0.5)
     high_sim = make_flower_sim_runner(cfg, strategy_name=args.strategy, round_scale=1.0)
 
@@ -77,7 +77,7 @@ def main() -> None:
     elif args.algo == "moga_fl":
         controller = MOGAFLController(cfg, low_fidelity_eval=low_sim, high_fidelity_eval=high_sim, pop_size=args.pop)
         pop, metrics = controller.run(generations=args.generations)
-    else:  # pymoo_nsga3
+    else:
         from src.ga.pymoo_nsga3 import run_pymoo_nsga3
 
         pop, metrics = run_pymoo_nsga3(
@@ -98,7 +98,6 @@ def main() -> None:
     df.to_csv(pareto_path, index=False)
     print(f"Saved Pareto candidates to {pareto_path}")
 
-    # 根据简单偏好规则选出一个“部署用”解，并导出新的策略 YAML。
     eval_cfg = cfg.get("eval", {}) if isinstance(cfg.get("eval", {}), dict) else {}
     preference = str(eval_cfg.get("preference", "time"))
     best_idx = _select_best(pop, metrics, preference)
@@ -121,6 +120,23 @@ def main() -> None:
     if "staleness_alpha" in best_params:
         fedbuff["staleness_alpha"] = float(best_params["staleness_alpha"])
     deploy_cfg["fedbuff"] = fedbuff
+
+    controller = deploy_cfg.get("controller", {}) if isinstance(deploy_cfg.get("controller", {}), dict) else {}
+    gates = controller.get("gate_thresholds", {}) if isinstance(controller.get("gate_thresholds", {}), dict) else {}
+    if "bridge_to_async" in best_params:
+        gates["to_async"] = float(best_params["bridge_to_async"])
+    if "bridge_to_semi_sync" in best_params:
+        gates["to_semi_sync"] = float(best_params["bridge_to_semi_sync"])
+    controller["gate_thresholds"] = gates
+    deploy_cfg["controller"] = controller
+
+    wireless = deploy_cfg.get("wireless", {}) if isinstance(deploy_cfg.get("wireless", {}), dict) else {}
+    if "bandwidth_alloc_factor" in best_params:
+        base_bw = float(wireless.get("bandwidth_budget_mb_per_round", 12.0))
+        wireless["bandwidth_budget_mb_per_round"] = float(base_bw * float(best_params["bandwidth_alloc_factor"]))
+    if "compression_ratio" in best_params:
+        wireless["payload_compression_ratio"] = float(best_params["compression_ratio"])
+    deploy_cfg["wireless"] = wireless
 
     best_cfg_path = "outputs/results/best_moga_fl_config.yaml"
     with open(best_cfg_path, "w", encoding="utf-8") as f:

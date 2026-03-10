@@ -306,105 +306,95 @@
 
 ---
 
-## 6. 改进型 MOGA‑FL：多目标遗传优化的工作流程
+## 6. 改进型 MOGA‑FL：多目标遗传优化的工作流程（2026-03-08 实现版）
 
 相关代码集中在 `src/ga/`：
 
-- `objectives.py`：定义四个目标指标（精度、时间、公平性、能耗）；
-- `constraints.py`：实现能耗预算等约束的惩罚与参数修复；
-- `nsga3.py`：简化版 NSGA‑III 风格优化器（保持非支配解多样性）；
-- `moead.py`：简化版 MOEA/D 风格优化器（基于权重向量的分解与邻域更新）；
-- `moga_fl.py`：`MOGAFLController`，组合 NSGA‑III + MOEA/D + 岛屿模型 + 局部搜索 + 多保真评估；
-- `pymoo_nsga3.py`：可选的、基于 `pymoo` 库的 NSGA-III 实现，鲁棒性更强；
-- `scripts/run_ga_optimization.py`：GA 入口脚本，负责调用评估器并将最优解写回配置。
+- `objectives.py`：统一目标接口（5 目标：精度、时间、能耗、通信成本、公平性）；
+- `constraints.py`：预算惩罚 + 染色体修复（Top-K、阈值关系、压缩比例、带宽因子、权重归一化）；
+- `nsga3.py`：带参考方向关联与 niche 选择的 NSGA‑III 风格实现；
+- `moead.py`：基于权重向量分解与邻域替换的 MOEA/D；
+- `moga_fl.py`：`MOGAFLController`（NSGA‑III→MOEA/D 双阶段、岛屿迁移、可行域局部搜索、多保真与精英记忆）；
+- `sim_runner_flower.py`：把染色体参数映射到 Flower 配置并聚合 `metrics.csv`；
+- `scripts/run_ga_optimization.py`：GA 入口与部署配置写回；
+- `pymoo_nsga3.py`：可选的 `pymoo` NSGA-III 对照实现（同一套 10 维编码、5 目标）。
 
-### 6.1 个体编码：要优化哪些参数？
+### 6.1 染色体编码（联合优化）
 
-在 `MOGAFLController._random_individual()` 中，一个候选解（染色体）包含：
+当前实现将以下变量共同编码为个体：
 
-- 调度评分权重：`energy_w, channel_w, data_w, fair_w`，分别对应能量、信道质量、数据价值与公平债务；
-- Top‑K 相关参数：`selection_top_k`（每轮选多少客户端）；
-- 异步相关参数：`staleness_alpha`（陈旧度加权的指数）。
+- 综合评分权重：`energy_w`, `channel_w`, `data_w`, `fair_w`；
+- 选择规模：`selection_top_k`；
+- 带宽分配系数：`bandwidth_alloc_factor`；
+- 异步陈旧度衰减：`staleness_alpha`；
+- 桥接触发阈值：`bridge_to_async`, `bridge_to_semi_sync`；
+- 通信压缩比例：`compression_ratio`（映射到 `wireless.payload_compression_ratio`）。
 
-（注：原设计中的 `bwcost_w` 与 `hysteresis` 已移除，因其在当前 `HybridWirelessStrategy` 中没有直接的应用入口，为简化搜索空间故去除。）
+### 6.2 多目标定义（5 目标）
 
-这些变量共同决定了：
+`evaluate_solution()` 返回并统一以下目标：
 
-- 哪些客户端更容易被选中参与训练；
-- 异步聚合时，旧梯度对新模型的贡献大小。
+- 最大化：`acc`, `fairness`；
+- 最小化：`time`, `energy`, `comm_cost`。
 
-### 6.2 多目标评估：四个维度的折衷
+其中：
 
-`objectives.evaluate_solution()` 封装了调用评估“信使”的过程，该“信使”实际运行一个短轮联邦训练：
+- `time` 来自 `metrics.csv` 的 `est_upload_time`；
+- `energy` 来自 `metrics.csv` 的 `energy`；
+- `comm_cost` 采用通信代理 `mean(topk * payload_mb)`；
+- `fairness` 采用 `jain` 均值。
 
-- **评估器**：`src/ga/sim_runner_flower.py` 中的 `make_flower_sim_runner` 负责构造一个基于 Flower 的仿真运行器。它会：
-  1. 启动一个与 `hybrid_opt_demo.py` 类似的 Flower 仿真；
-  2. 根据 GA 个体提供的参数，动态修改仿真配置（如调度权重、Top-K 等）；
-  3. 运行一个缩短轮数的“低保真”或完整轮数的“高保真”训练；
-  4. 训练结束后，读取策略（`HybridWirelessStrategy`）输出的 `metrics.csv` 文件。
-- **指标聚合**：从 `metrics.csv` 中读取 `accuracy`, `est_upload_time`, `jain`, `energy` 列，计算其均值作为最终的四个目标：
-  - `acc`：全局精度（希望越大越好）；
-  - `time`：通信时间（希望越小越好）；
-  - `fairness`：Jain 指数等公平性度量（希望越大越好）；
-  - `energy`：能耗（通信 + 计算，越小越好）。
+### 6.3 约束修复与惩罚
 
-`constraints.penalty()` 会根据能耗是否超过预算（优先从 `controller.bridge_invariants.energy_budget_round` 读取预算）给出一个惩罚值，并在指标中略微拉高 `energy`，从而在优化过程中自然排斥超预算解；`repair()` 则负责修复不合法的参数（例如 Top‑K 至少为 1、陈旧度指数在 [0.5, 2.0] 区间）。
+`constraints.repair()` 负责修复不可行个体：
 
-### 6.3 NSGA‑III 岛屿：保持多样性
+- `selection_top_k >= 1`；
+- `staleness_alpha`、`bandwidth_alloc_factor`、`compression_ratio` 在合法范围内；
+- `bridge_to_semi_sync <= bridge_to_async - 0.03`（保持门控阈值顺序）；
+- 调度权重非负并归一化。
 
-`NSGA3` 类实现了一个简化版 NSGA‑III 流程：
+`constraints.penalty()` 对预算超限进行软惩罚并加到最小化目标中，覆盖：
 
-- 初始化种群，随机采样一批候选参数；
-- 每一代：
-  1. 用 `evaluate_solution()` 计算每个个体的多目标指标和惩罚；
-  2. 使用 `non_dominated_set()` 选出当前非支配解集合（即 Pareto 前沿）；
-  3. 以这些非支配解为核心，随机交叉 + 变异生成下一代，保持种群多样性。
+- 能量预算（优先 `controller.bridge_invariants.energy_budget_round`）；
+- 上传时间预算（`upload_time_budget_round`）；
+- 通信成本预算（按当前配置估计的 proxy budget）。
 
-在 `MOGAFLController._run_nsga3_island()` 中，这个 NSGA‑III 岛屿被用作“广度优先探索器”：在较小代数下找到覆盖面较广的 Pareto 候选，为后续 MOEA/D 岛屿提供好的起点。
+### 6.4 NSGA‑III + MOEA/D 双阶段协同
 
-此外，我们还引入了基于 `pymoo` 库的 NSGA-III 实现 (`src/ga/pymoo_nsga3.py`) 作为可选项。`pymoo` 是一个成熟的多目标优化库，其 NSGA-III 实现比我们的简化版更鲁棒，尤其在处理约束和多样性维持方面。用户可以通过 `--algo pymoo_nsga3` 命令行选项来启用它，以应对更复杂的搜索场景。
+`MOGAFLController.run()` 的核心流程：
 
-### 6.4 MOEA/D 岛屿：加速收敛
+1. NSGA‑III 阶段：参考方向维持解集分布性，做广覆盖探索；
+2. 岛屿迁移：将 NSGA‑III 非支配精英迁移到 MOEA/D 初始种群；
+3. MOEA/D 阶段：按权重子问题和邻域替换强化收敛；
+4. 合并后再取低保真非支配精英。
 
-`MOEAD` 类实现了基于权重向量分解的简化 MOEA/D：
+### 6.5 可行域局部搜索 + 多保真 + 精英记忆
 
-- 初始化一组权重向量 `w[i]`，每个向量代表一个“子问题”（不同的目标偏好组合）；
-- 对于每个个体，使用 `scalarize(metrics, w[i])` 将多目标指标压缩为一个标量；
-- 每一代内，在邻域中选择父代进行交叉和微小变异，如果子代的 scalar 值更好，就替换当前个体。
+- 可行域局部搜索：围绕能耗/时间/通信成本约束边界，对精英个体做定向微调（如压缩比例、Top-K、带宽因子、桥接阈值）；
+- 多保真评估：早期低保真筛选，后期对“精英+邻域”做高保真复评；
+- 精英记忆：以标准化染色体 key 缓存低/高保真评估结果，减少重复开销。
 
-在 `MOGAFLController._run_moead_island()` 中，这个 MOEA/D 岛屿以 NSGA‑III 岛屿输出的精英解为初始种群的一部分，从而在保持多样性的前提下增强“局部收敛能力”。
+### 6.6 部署偏好与配置落地
 
-### 6.5 岛屿模型 + 迁移 + 局部搜索
+`scripts/run_ga_optimization.py` 支持三类部署偏好：
 
-`MOGAFLController.run()` 将上述两个子算法组合成一个结构化的搜索流程：
+- `time` 优先；
+- `energy` 优先；
+- `fairness` 优先。
 
-1. 岛屿 1（NSGA‑III）：
-   - 以随机种群为起点运行若干代，得到一批非支配解 `nsga_pop`；
-2. 迁移：
-   - 从 `nsga_pop` 中选出非支配前沿精英做“移民”，作为 MOEA/D 岛屿的初始种群一部分；
-3. 岛屿 2（MOEA/D）：
-   - 以“精英 + 随机填充”的方式初始化种群，运行若干代加强收敛；
-4. 合并：
-   - 将两个岛屿的候选合并为大种群 `all_pop`；
-5. 局部搜索（Memetic）：
-   - 在 `non_dominated_set(all_metrics_low)` 得到的低保真非支配精英附近做小范围扰动，得到邻域解 `neighbors`；
-   - 扰动时对权重做微小高斯噪声并重新归一化，对 Top‑K、staleness_alpha 做轻微调整；
-6. 多保真评估：
-   - 对“精英 + 邻域”组合使用高保真评估器（完整轮数或更长训练）重新评估；
-   - 再次取 Pareto 前沿，作为最终 MOGA‑FL 输出的候选解集合。
+脚本输出：
 
-### 6.6 GA 结果如何部署到联邦学习模型？
+- `outputs/results/pareto_candidates.csv`；
+- `outputs/results/best_moga_fl_config.yaml`。
 
-入口脚本 `scripts/run_ga_optimization.py` 负责完成“从搜索到部署”的闭环：
+并将最优个体回写到运行配置中，包括：
 
-1. 使用 `src/configs/strategy_runtime.load_strategy_yaml` 加载策略配置，并通过 `src/ga/sim_runner_flower.make_flower_sim_runner` 构造低保真与高保真评估器；
-2. 调用 `MOGAFLController.run()` 或其他 GA 算法获得 Pareto 候选解及其指标；
-3. 根据配置中的 `preference`（`time` / `fairness` / `energy` 等）对候选解做简单加权评分，选出一个“偏好最优”解；
-4. 将该解中的参数写入 `outputs/results/best_moga_fl_config.yaml`：
-   - `scheduler.weights.*`：覆盖能量/信道/数据/公平性权重；
-   - `scheduler.selection_top_k`：覆盖调度 Top‑K 参数；
-   - `fedbuff.staleness_alpha`：覆盖异步陈旧度加权参数；
-5. 最终，用户可以直接使用这个 best 配置重新运行 Flower 仿真，即完成“经 GA 优化后的联邦训练部署”。
+- `scheduler.weights.*`；
+- `scheduler.selection_top_k`；
+- `fedbuff.staleness_alpha`；
+- `controller.gate_thresholds.to_async/to_semi_sync`；
+- `wireless.bandwidth_budget_mb_per_round`（经 `bandwidth_alloc_factor`）；
+- `wireless.payload_compression_ratio`。
 
 ---
 
